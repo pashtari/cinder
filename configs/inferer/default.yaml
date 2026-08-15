@@ -1,0 +1,7 @@
+_target_: cinder.engine.inferers.SlidingWindowInferer
+roi_size: ${dataset.crop_size}
+sw_batch_size: ${dataset.batch_size}
+overlap: 0.25
+mode: gaussian
+sigma_scale: 0.125
+amp: ${trainer.amp}

@@ -1,0 +1,7 @@
+defaults:
+    - default
+
+loss:
+    _target_: cinder.engine.losses.DiceCELoss
+    sigmoid: true
+    squared_pred: true

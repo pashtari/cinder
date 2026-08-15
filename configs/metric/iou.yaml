@@ -1,0 +1,4 @@
+iou:
+    _target_: cinder.IoUMetric
+    num_classes: ${dataset.num_classes}
+    ignore_index: 0

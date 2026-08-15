@@ -1,0 +1,14 @@
+defaults:
+    - default
+
+max_epochs: 100
+eval_every_epochs: 10
+
+lr: 1e-4
+weight_decay: 1e-2
+
+amp: true
+
+loss:
+    _target_: torch.nn.CrossEntropyLoss
+    ignore_index: 0

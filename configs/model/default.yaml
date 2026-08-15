@@ -1,0 +1,24 @@
+_target_: cinder.CINDER
+
+in_channels: 3
+out_channels: ${dataset.num_classes}
+in_size: ${dataset.crop_size}
+
+encoder:
+    _target_: cinder.TimmEncoder
+    _partial_: true
+    model_name: "tf_efficientnetv2_m.in21k_ft_in1k" #"tf_efficientnetv2_s.in21k_ft_in1k"
+    pretrained: true
+    normalize: true
+    out_index: null # higher-resolution intermediate stage -> richer spatial features
+    # model_name: "tiny_vit_21m_384.dist_in22k_ft_in1k"
+    # pretrained: true
+    # normalize: true
+    # out_index: null
+
+cinr:
+    _target_: ???
+    _partial_: true
+
+freeze_encoder: false
+sampling_ratio: 1.0

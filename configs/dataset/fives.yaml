@@ -1,0 +1,16 @@
+defaults:
+    - default
+
+num_classes: 1
+
+crop_size: [480, 480]
+
+train_datalist:
+    _target_: cinder.datasets.fives.create_datalist
+    root: ${path.dataset_dir}
+    split: train
+
+val_datalist:
+    _target_: cinder.datasets.fives.create_datalist
+    root: ${path.dataset_dir}
+    split: test

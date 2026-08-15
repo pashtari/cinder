@@ -1,0 +1,8 @@
+tensorboard:
+    _target_: cinder.handlers.tensorboard
+    _partial_: true
+    output_path: ${path.output_dir}/tensorboard
+    # Log `input | ground-truth | prediction` panels for this many validation
+    # cases after every evaluation (set num_examples: 0 to disable).
+    log_images: true
+    num_examples: 2

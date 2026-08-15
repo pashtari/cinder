@@ -1,0 +1,14 @@
+defaults:
+    - default
+
+num_classes: 151
+
+train_datalist:
+    _target_: cinder.datasets.ade20k.create_datalist
+    root: ${path.dataset_dir}
+    split: training
+
+val_datalist:
+    _target_: cinder.datasets.ade20k.create_datalist
+    root: ${path.dataset_dir}
+    split: validation

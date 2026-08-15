@@ -1,0 +1,15 @@
+defaults:
+    - _self_
+    - path: default
+    - hydra: default
+    - dataset: glas
+    - model: cinder_futon
+    - handler: [checkpoint, proglogger]
+    - trainer: glas
+    - inferer: default
+    - metric: [dice, hd95]
+
+tag: ""
+phase: "eval"
+experiment: ${hydra:runtime.choices.dataset}_${hydra:runtime.choices.model}
+seed: 42

@@ -1,0 +1,59 @@
+batch_size: 8
+val_batch_size: 1
+num_workers: 16
+
+crop_size: [512, 512]
+
+train_transform:
+    _target_: torchvision.transforms.v2.Compose
+    transforms:
+        - _target_: torchvision.transforms.v2.RandomCrop
+          size: ${dataset.crop_size}
+          pad_if_needed: true
+        - _target_: torchvision.transforms.v2.RandomHorizontalFlip
+          p: 0.5
+        - _target_: torchvision.transforms.v2.RandomApply
+          p: 0.5
+          transforms:
+              - _target_: torchvision.transforms.v2.RandomRotation
+                degrees: 15
+        - _target_: torchvision.transforms.v2.RandomApply
+          p: 0.5
+          transforms:
+              - _target_: torchvision.transforms.v2.ColorJitter
+                brightness: 0.2
+                contrast: 0.2
+                saturation: 0.2
+
+val_transform: null
+
+# datasets
+train_set:
+    _target_: cinder.SegmentationDataset
+    datalist: ${dataset.train_datalist}
+    transform: ${dataset.train_transform}
+    num_classes: ${dataset.num_classes}
+
+val_set:
+    _target_: cinder.SegmentationDataset
+    datalist: ${dataset.val_datalist}
+    transform: ${dataset.val_transform}
+    num_classes: ${dataset.num_classes}
+
+# dataloaders
+train_loader:
+    _target_: ignite.distributed.auto_dataloader
+    dataset: ${dataset.train_set}
+    batch_size: ${dataset.batch_size}
+    num_workers: ${dataset.num_workers}
+    pin_memory: true
+    shuffle: true
+    drop_last: true
+
+val_loader:
+    _target_: ignite.distributed.auto_dataloader
+    dataset: ${dataset.val_set}
+    batch_size: ${dataset.val_batch_size}
+    num_workers: ${dataset.num_workers}
+    pin_memory: true
+    shuffle: false

@@ -1,0 +1,4 @@
+hd95:
+    _target_: cinder.HausdorffDistanceMetric
+    num_classes: ${dataset.num_classes}
+    percentile: 95.0
