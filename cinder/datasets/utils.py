@@ -48,14 +48,28 @@ class SegmentationDataset(Dataset):
         num_classes: Number of segmentation classes.
             ``1`` → binary mode (target thresholded to {0, 1} float).
             ``>1`` → multi-class mode (target kept as long class indices).
+        instance_labels: Binary mode only. Keep the annotation's own integer
+            labels instead of collapsing them to {0, 1}. Some datasets number
+            each object separately — GlaS gives every gland its own value — and
+            thresholding here would throw that away before any metric could use
+            it. Metrics that only need a foreground mask threshold it themselves,
+            so this is safe to leave on for evaluation; training keeps the
+            default because the losses expect {0, 1} targets.
     """
 
     _to_float = v2.ToDtype(torch.float32, scale=True)
 
-    def __init__(self, datalist: list[dict], transform=None, num_classes: int = 1):
+    def __init__(
+        self,
+        datalist: list[dict],
+        transform=None,
+        num_classes: int = 1,
+        instance_labels: bool = False,
+    ):
         self.datalist = datalist
         self.transform = transform
         self.num_classes = num_classes
+        self.instance_labels = instance_labels
 
     def __len__(self):
         return len(self.datalist)
@@ -76,7 +90,7 @@ class SegmentationDataset(Dataset):
         input = self._to_float(input)
 
         if self.num_classes == 1:
-            target = (target > 0).float()
+            target = target.long() if self.instance_labels else (target > 0).float()
         else:
             target = target.long().squeeze(0)  # (H, W) class indices
 

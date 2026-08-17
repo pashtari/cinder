@@ -1,0 +1,6 @@
+object_dice:
+    _target_: cinder.ObjectDice
+    # Probability cut, then connected components, then matching against the
+    # target's per-object labels -- so dataset.instance_labels must be true.
+    threshold: 0.5
+    min_object_size: 0

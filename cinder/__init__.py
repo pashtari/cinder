@@ -14,4 +14,7 @@ from .engine import (
     DiceMetric,
     IoUMetric,
     HausdorffDistanceMetric,
+    DetectionF1,
+    ObjectDice,
+    ObjectHausdorff,
 )

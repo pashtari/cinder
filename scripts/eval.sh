@@ -18,11 +18,13 @@
 # Example:
 #   eval.sh --gpus=1 --dataset=fives --model=cinder_futon --metric='[dice,hd95]' --path.dataset_dir=/scratch/data/FIVES --handler.checkpoint.load_from=path/to/checkpoint.pt
 #
-# GlaS — report Test A and Test B separately (run once per section):
-#   eval.sh --gpus=1 --dataset=glas --model=cinder_futon --metric='[dice,hd95]' --path.dataset_dir=/scratch/data/GlaS --dataset.test_section=testA --handler.checkpoint.load_from=path/to/checkpoint.pt
-#   eval.sh --gpus=1 --dataset=glas --model=cinder_futon --metric='[dice,hd95]' --path.dataset_dir=/scratch/data/GlaS --dataset.test_section=testB --handler.checkpoint.load_from=path/to/checkpoint.pt
+# GlaS — report Test A and Test B separately (run once per section), and use the
+# object-level metrics the gland-segmentation literature is written in; the
+# pixel-level dice/hd95 are NOT comparable to published GlaS numbers:
+#   eval.sh --gpus=1 --dataset=glas --metric='[f1,object_dice,object_hausdorff]' --path.dataset_dir=/scratch/data/GlaS --dataset.test_section=testA --handler.checkpoint.load_from=path/to/checkpoint.pt
+#   eval.sh --gpus=1 --dataset=glas --metric='[f1,object_dice,object_hausdorff]' --path.dataset_dir=/scratch/data/GlaS --dataset.test_section=testB --handler.checkpoint.load_from=path/to/checkpoint.pt
 
 MODULE="cinder.engine.eval"
-USAGE="$(sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//')"
+USAGE="$(sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//')"
 
 source "$(dirname "${BASH_SOURCE[0]}")/_launch.sh"

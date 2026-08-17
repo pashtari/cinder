@@ -143,3 +143,71 @@ class SlidingWindowInferer:
         out /= count
         # Crop back to original spatial size
         return out[:, :, :H, :W]
+
+
+class MultiScaleFlipInferer:
+    """Test-time augmentation over scales and horizontal flips.
+
+    Wraps another inferer (typically :class:`SlidingWindowInferer`) and averages
+    its predictions over rescaled and mirrored copies of the input. This is the
+    "MS+flip" column that ADE20K results are conventionally reported with,
+    alongside the single-scale number -- the two are not interchangeable, and a
+    comparison must use the same setting for every method.
+
+    Predictions are averaged as **logits**, matching what the metrics in
+    :mod:`cinder.engine.metrics` expect (they apply sigmoid or argmax
+    themselves). Averaging probabilities instead is a defensible alternative
+    convention; it is not what this does.
+
+    Args:
+        inferer: The base inferer to wrap.
+        scales: Resize factors applied to the input. Must include 1.0 to keep
+            the un-scaled view.
+        flip: Also evaluate a horizontally mirrored copy of each scale.
+        align_corners: Passed to the interpolation, both down and back up.
+    """
+
+    def __init__(
+        self,
+        inferer: Callable[..., Tensor],
+        scales: tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75),
+        flip: bool = True,
+        align_corners: bool = False,
+    ) -> None:
+        self.inferer = inferer
+        self.scales = tuple(scales)
+        self.flip = flip
+        self.align_corners = align_corners
+
+    def __call__(
+        self, inputs: Tensor, predictor: Callable[..., Tensor], **kwargs
+    ) -> Tensor:
+        _, _, H, W = inputs.shape
+        total = None
+        views = 0
+
+        for scale in self.scales:
+            if scale == 1.0:
+                scaled = inputs
+            else:
+                size = (max(1, round(H * scale)), max(1, round(W * scale)))
+                scaled = torch.nn.functional.interpolate(
+                    inputs, size=size, mode="bilinear", align_corners=self.align_corners
+                )
+
+            for mirrored in (False, True) if self.flip else (False,):
+                view = torch.flip(scaled, dims=[-1]) if mirrored else scaled
+                pred = self.inferer(view, predictor, **kwargs)
+                if mirrored:
+                    pred = torch.flip(pred, dims=[-1])
+                if pred.shape[-2:] != (H, W):
+                    pred = torch.nn.functional.interpolate(
+                        pred,
+                        size=(H, W),
+                        mode="bilinear",
+                        align_corners=self.align_corners,
+                    )
+                total = pred if total is None else total + pred
+                views += 1
+
+        return total / views

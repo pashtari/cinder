@@ -3,7 +3,9 @@ defaults:
 
 num_classes: 1
 
-crop_size: [480, 480]
+# The *_anno.bmp files label each gland separately, which the object-level
+# metrics need and pixel metrics ignore.
+instance_labels: true
 
 test_section: test # testA or testB
 
