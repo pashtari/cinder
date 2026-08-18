@@ -1,29 +1,45 @@
-# Python
+# --- job output: slurm logs, checkpoints, run artifacts ---
+logs/
+
+# --- staged PyPI wheels: a build artifact, rebuilt by prefetch_wheels.sh ---
+# scripts/hpc/ itself IS tracked -- the job scripts are project artifacts and
+# git is how they reach the cluster. Only the wheel cache is excluded.
+scripts/hpc/wheels/
+
+# --- datasets live on scratch, never in the repo ---
+data/
+*.pth
+*.ckpt
+*.pt
+
+# --- python ---
 __pycache__/
 *.py[cod]
 *.egg-info/
 *.egg
 *.so
+.venv/
+venv/
 
-# Build / Distribution
+# --- build / distribution ---
 build/
 dist/
 .eggs/
 
-# Virtual environments
-.venv/
-venv/
+# --- test / tooling caches ---
+.pytest_cache/
+.ruff_cache/
 
-# IDE
+# --- IDE ---
 .vscode/
 .idea/
 
-# OS
+# --- machine-local agent settings ---
+.claude/settings.local.json
+
+# --- OS ---
 .DS_Store
 Thumbs.db
 
-# # Logs
-# logs/
-
-# Unwanted folders
+# --- unwanted folders ---
 .trash/

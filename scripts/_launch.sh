@@ -51,11 +51,17 @@ _run_plain() {  # $1 = CUDA_VISIBLE_DEVICES value
     CUDA_VISIBLE_DEVICES="$1" python -m "$MODULE" "${HYDRA_ARGS[@]}"
 }
 
+# Launch via `python -m torch.distributed.run`, never the `torchrun` console
+# script. torchrun's shebang hard-codes the interpreter that installed PyTorch,
+# and it spawns every rank with that same sys.executable -- so under a
+# virtualenv layered on a system/module PyTorch (as on HPC-UGent), all the
+# workers start outside the venv and fail on its packages. Going through
+# `python -m` keeps the ranks on the active interpreter.
 _run_dist() {   # $1 = nproc, $2 = optional CUDA_VISIBLE_DEVICES
     if [[ -n "${2:-}" ]]; then
-        CUDA_VISIBLE_DEVICES="$2" torchrun --nproc_per_node="$1" -m "$MODULE" "${HYDRA_ARGS[@]}"
+        CUDA_VISIBLE_DEVICES="$2" python -m torch.distributed.run --nproc_per_node="$1" -m "$MODULE" "${HYDRA_ARGS[@]}"
     else
-        torchrun --nproc_per_node="$1" -m "$MODULE" "${HYDRA_ARGS[@]}"
+        python -m torch.distributed.run --nproc_per_node="$1" -m "$MODULE" "${HYDRA_ARGS[@]}"
     fi
 }
 

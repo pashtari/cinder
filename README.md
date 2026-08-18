@@ -16,7 +16,7 @@ network whose CP-decomposed weights are contracted with the condition vector.
 
 ## Installation
 
-**Prerequisites:** Python ≥ 3.10, PyTorch ≥ 2.10
+**Prerequisites:** Python ≥ 3.10, PyTorch ≥ 2.1
 
 ```bash
 git clone https://github.com/pashtari/cinder.git

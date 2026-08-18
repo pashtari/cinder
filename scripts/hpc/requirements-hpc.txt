@@ -1,0 +1,28 @@
+# Packages cinder needs that have no EasyBuild module on HPC-UGent.
+#
+# Everything else -- torch, torchvision, timm, numpy, scipy, PIL, tensorboard,
+# yaml, tqdm -- comes from the modules loaded in env.sh. Do NOT pip install
+# those: it would shadow the CUDA-enabled builds with CPU wheels from PyPI.
+#
+# Installed with --no-deps (compute nodes are offline), so this list is the
+# full transitive closure, not just the top-level names.
+
+# pytorch-ignite 0.5.4+ requires torch>=2.2; the newest CUDA-matched torch here
+# is 2.1.2, and 0.5.3 is the last release that pairs with it. Without this pin
+# --no-deps would silently install an ignite built against a torch we do not
+# have. Revisit when a newer CUDA-matched PyTorch module appears.
+pytorch-ignite==0.5.3
+
+# The timm module is 1.0.8, predating the DINOv3 weights the model config uses,
+# and being on PYTHONPATH it would shadow this one -- so env.sh does not load it.
+# Pure Python, so it layers over the module torch without trouble.
+timm>=1.0.20
+huggingface_hub                 # timm fetches pretrained weights through it
+safetensors                     # timm's weight format
+tqdm                            # came in with the timm module, now needs listing
+
+hydra-core                      # config system (configs/*.yaml)
+omegaconf                       # hydra-core dep, also imported directly
+antlr4-python3-runtime==4.9.3   # omegaconf 2.3 pins 4.9.*; a newer runtime breaks its parser
+hydra-colorlog                  # configs/hydra/default.yaml: override hydra_logging
+colorlog                        # hydra-colorlog dep
