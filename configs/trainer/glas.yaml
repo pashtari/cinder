@@ -1,6 +1,13 @@
 defaults:
     - default
 
+max_iters: 10000
+
+# One evaluation pass is ~13 s here (165 images at 512^2), so curve resolution
+# is nearly free: 20 points over the budget for ~5% overhead. Worth having --
+# GlaS is where the train/val gap opens early enough to need watching.
+eval_interval: 500
+
 loss:
     _target_: cinder.engine.losses.DiceCELoss
     sigmoid: true

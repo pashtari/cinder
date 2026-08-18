@@ -15,8 +15,25 @@ def load_checkpoint(load_from):
 
 
 def checkpoint(
-    objects, load_from=None, save_every_epochs=1, load_checkpoint_kwargs=None, **kwargs
+    objects,
+    load_from=None,
+    score_metric=None,
+    score_mode="max",
+    load_checkpoint_kwargs=None,
+    **kwargs,
 ):
+    """Checkpoint handler.
+
+    Saves once per evaluation interval (the engine's epoch, see
+    ``cinder/engine/train.py``). With *score_metric* unset the latest checkpoint
+    is kept; set it to a validation metric name (e.g. ``"dice"``) to keep the
+    best-scoring one instead, chosen on the validation engine's metrics. Which
+    of the two a paper reports has to be the same for every method compared, so
+    it is recorded in the config rather than left implicit.
+
+    Checkpoints are named by iteration, since that is the unit the training
+    budget is expressed in.
+    """
 
     load_checkpoint_kwargs = (
         {} if load_checkpoint_kwargs is None else load_checkpoint_kwargs
@@ -38,14 +55,33 @@ def checkpoint(
         }
 
         if rank == 0:
-            model_checkpoint = ModelCheckpoint(
-                global_step_transform=global_step_from_engine(trainer), **kwargs
-            )
-            trainer.add_event_handler(
-                Events.EPOCH_COMPLETED(every=save_every_epochs) | Events.COMPLETED,
-                model_checkpoint,
-                to_save,
-            )
+            if score_metric is None:
+                model_checkpoint = ModelCheckpoint(
+                    global_step_transform=global_step_from_engine(
+                        trainer, Events.ITERATION_COMPLETED
+                    ),
+                    **kwargs,
+                )
+                trainer.add_event_handler(
+                    Events.EPOCH_COMPLETED | Events.COMPLETED,
+                    model_checkpoint,
+                    to_save,
+                )
+            else:
+                # Fired on the validation engine, whose state holds the metrics.
+                sign = 1.0 if score_mode == "max" else -1.0
+                model_checkpoint = ModelCheckpoint(
+                    score_name=score_metric,
+                    score_function=lambda engine: sign
+                    * float(engine.state.metrics[score_metric]),
+                    global_step_transform=global_step_from_engine(
+                        trainer, Events.ITERATION_COMPLETED
+                    ),
+                    **kwargs,
+                )
+                objects["val_evaluator"].add_event_handler(
+                    Events.COMPLETED, model_checkpoint, to_save
+                )
 
         if load_from is not None:
             ckpt = load_checkpoint(load_from)

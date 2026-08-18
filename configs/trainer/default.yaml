@@ -1,12 +1,55 @@
-max_epochs: 1000
-eval_every_epochs: 50
+# The training budget is counted in optimizer steps, not epochs. An epoch is a
+# property of the dataset -- 20000 iterations means the same amount of learning
+# on 85 images as on 20210, where "300 epochs" does not -- and it keeps the
+# budget independent of batch size, which is what the segmentation literature
+# quotes and what every baseline config is written in.
+max_iters: 20000
 
-lr: 5e-4
-weight_decay: 0.0
+# Evaluation cadence, in iterations, which is also the checkpoint interval and
+# the engine's epoch length (see cinder/engine/train.py).
+#
+# Absolute, not a share of max_iters, because evaluation costs what the
+# validation set costs, not what the budget costs. A fixed interval also lets a
+# short debug run collapse to a single evaluation; at 10% it would always be ten,
+# and a 600-iteration FIVES run would spend 79% of its wall clock evaluating
+# rather than 28%. Set it per dataset from the measured cost of one pass.
+#
+# Must divide max_iters: the engine runs whole intervals, so a remainder would
+# overshoot the budget and carry the LR schedule past its horizon.
+eval_interval: 2000 # 10 evaluations over the default 20k budget
+
+# Iterations between progress reports -- both the console/file log and the
+# TensorBoard scalar curves. Separate from eval_interval, which is far longer:
+# evaluation is expensive, but progress should stay visible in between.
+#
+# Absolute, not derived from the dataset. "One pass over the training set" scales
+# badly across these three -- a pass is 5 iterations on GlaS and 1263 on ADE20K,
+# so the same nominal setting would give 2000 log lines on one and 126 on the
+# other. 50 is the mmsegmentation/timm default and gives 200-3200 points per run
+# here, which is both readable as a log and smooth as a curve.
+log_interval: 50
+
+# Fraction of the training set scored at each evaluation, as a diagnostic only.
+# A full pass costs the size of the training set: on ADE20K that is 20210 of the
+# 22210 images an evaluation touches. 0 disables it, 1.0 restores the full pass.
+eval_train_ratio: 1.0
+
+lr: 3e-4
+weight_decay: 0.01
+
+# Linear warmup over 1% of the budget -- the fraction ADE20K's conventional
+# 1500-of-160k represents. Derived rather than written out, so it keeps tracking
+# max_iters when the budget is overridden from the command line.
+warmup_iters: ${frac:${trainer.max_iters},0.01}
+warmup_start_lr: 1.0e-6
 
 amp: true
 non_blocking: true
 find_unused_parameters: true
+
+# Synchronise BatchNorm across ranks, so a 2-GPU run is comparable to a 1-GPU
+# one. Applied only when world size > 1 (see cinder/engine/train.py).
+sync_bn: true
 
 loss:
     _target_: torch.nn.BCEWithLogitsLoss
@@ -20,5 +63,5 @@ optimizer:
 lr_scheduler:
     _target_: torch.optim.lr_scheduler.CosineAnnealingLR
     _partial_: true
-    T_max: ${trainer.max_epochs}
+    T_max: ${trainer.max_iters}
     eta_min: 0.0

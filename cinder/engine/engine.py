@@ -4,7 +4,7 @@ import torch
 from ignite.engine import Engine
 
 
-def create_trainer(model, optimizer, loss_fn, device):
+def create_trainer(model, optimizer, loss_fn, device, amp=False):
     """Create an Ignite training engine.
 
     Args:
@@ -12,10 +12,25 @@ def create_trainer(model, optimizer, loss_fn, device):
         optimizer: The optimizer.
         loss_fn: Loss function (e.g., ``cinder.SampledLoss``-wrapped).
         device: Target device.
+        amp: Run the forward pass and loss under CUDA autocast. Uses bfloat16
+            where the device supports it (Ampere and newer), which needs no loss
+            scaling; otherwise float16 with a ``GradScaler``. Ignored on CPU.
 
     Returns:
         An ``ignite.engine.Engine`` that yields ``loss.item()`` per step.
     """
+    use_amp = bool(amp) and device.type == "cuda"
+    dtype = (
+        torch.bfloat16
+        if use_amp and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
+    # torch.amp.GradScaler is the 2.4+ spelling; 2.1 only has torch.cuda.amp.
+    needs_scaler = use_amp and dtype is torch.float16
+    if hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler("cuda", enabled=needs_scaler)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=needs_scaler)
 
     def train_step(engine, batch):
         model.train()
@@ -24,10 +39,12 @@ def create_trainer(model, optimizer, loss_fn, device):
         targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        preds = model(inputs)
-        loss = loss_fn(preds, targets)
-        loss.backward()
-        optimizer.step()
+        with torch.autocast("cuda", dtype=dtype, enabled=use_amp):
+            preds = model(inputs)
+            loss = loss_fn(preds, targets)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         return loss.item()
 

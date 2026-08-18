@@ -1,6 +1,14 @@
 defaults:
     - default
 
+# Evaluation is the expensive half here: a pass over the 200 test images at
+# 2048^2 takes minutes, so the train-set diagnostic is set to only 10%.
+eval_train_ratio: 0.1
+
+# ~2 min per pass, so 10 evaluations over the 20k budget already costs ~10% of
+# the run. Finer resolution is not worth it on this dataset.
+eval_interval: 2000
+
 loss:
     _target_: cinder.engine.losses.DiceCELoss
     sigmoid: true

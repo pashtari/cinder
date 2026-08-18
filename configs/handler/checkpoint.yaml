@@ -4,5 +4,9 @@ checkpoint:
     dirname: ${path.output_dir}/checkpoints
     require_empty: false
     n_saved: 1
-    save_every_epochs: 1
+    # null keeps the last checkpoint; a validation metric name (e.g. dice, iou)
+    # keeps the best-scoring one instead. Whichever is used must be the same for
+    # every method in a comparison.
+    score_metric: null
+    score_mode: max
     load_from: null

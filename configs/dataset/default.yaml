@@ -1,5 +1,16 @@
-batch_size: 8
+# GLOBAL batch size, shared by every dataset: ignite.distributed.auto_dataloader
+# divides it by world size, so 16 is 8 per GPU on two GPUs. Holding it fixed is
+# what makes the per-dataset iteration budgets mean the same thing, and matches
+# the ADE20K convention every published baseline is trained under.
+batch_size: 16
+
+# Must stay 1. val_transform is null, so validation images keep their native
+# sizes -- GlaS has 5 distinct sizes across 80 images, ADE20K 182 across 2000 --
+# and the default collate cannot stack tensors of differing shape. Evaluation is
+# batched instead by the sliding-window inferer's sw_batch_size, which batches
+# windows within a single image and so is size-agnostic.
 val_batch_size: 1
+
 num_workers: 16
 
 crop_size: [512, 512]
@@ -27,6 +38,12 @@ train_transform:
 
 val_transform: null
 
+# Keep the annotation's per-object labels on the *validation* set, for the
+# object-level metrics. Pixel metrics threshold the target themselves, so this
+# is inert for them; training is unaffected either way, since it builds
+# train_set. Datasets whose annotations number each object set this to true.
+instance_labels: false
+
 # datasets
 train_set:
     _target_: cinder.SegmentationDataset
@@ -39,6 +56,7 @@ val_set:
     datalist: ${dataset.val_datalist}
     transform: ${dataset.val_transform}
     num_classes: ${dataset.num_classes}
+    instance_labels: ${dataset.instance_labels}
 
 # dataloaders
 train_loader:
