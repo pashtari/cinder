@@ -2,4 +2,4 @@ proglogger:
     _target_: cinder.handlers.proglogger
     _partial_: true
     filepath: ${path.output_dir}/${phase}.log
-    steps: false
+    log_interval: ${trainer.log_interval}

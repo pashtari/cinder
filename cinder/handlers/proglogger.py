@@ -47,12 +47,57 @@ def _fmt_time(seconds):
         return f"{h}h {m:02d}m"
 
 
-def proglogger(objects, steps=False, **kwargs):
+def _samples_seen(engine):
+    """Number of samples an evaluation run actually processed.
+
+    ``len(dataloader.dataset)`` is wrong whenever the run was truncated with
+    ``epoch_length`` (as the sub-sampled train-set pass is), so derive it from
+    the iterations that ran and fall back to the dataset size.
+    """
+    state = engine.state
+    loader = state.dataloader
+    iterations = state.epoch_length or 0
+    if not iterations:
+        return len(loader.dataset)
+    # Loader length and batch size are both per rank under DDP, while the
+    # dataset is the global one -- so scale up before comparing the two.
+    batch_size = getattr(loader, "batch_size", None) or 1
+    seen = iterations * batch_size * idist.get_world_size()
+    return min(seen, len(loader.dataset))
+
+
+def _progress(iteration, objects):
+    """``Iter 2000/20000 │ Epoch 400/4000`` for a position in training.
+
+    Training is budgeted in iterations, but "how many times the model has seen
+    each image" is still the quantity the small-dataset literature reports, so
+    both are shown. Epochs here are true passes over the training set, not the
+    engine's epochs (which are evaluation intervals).
+    """
+    max_iters = objects.get("max_iters") or iteration
+    per_pass = max(objects.get("iters_per_pass") or 1, 1)
+    total_epochs = max_iters / per_pass
+    # Real budgets are hundreds of passes and read best as integers; a short
+    # debug run can be a fraction of one pass, where rounding to "0/1" would
+    # hide all the progress there is.
+    fmt = ".1f" if total_epochs < 10 else ".0f"
+    wi = len(str(max_iters))
+    we = len(f"{total_epochs:{fmt}}")
+    return (
+        f"Iter {iteration:>{wi}}/{max_iters} │ "
+        f"Epoch {iteration / per_pass:>{we}{fmt}}/{total_epochs:{fmt}}"
+    )
+
+
+def proglogger(objects, log_interval=50, **kwargs):
     """
     Create a progress logger handler for Ignite trainers and evaluators.
 
     Args:
         objects: Dictionary containing trainer, train_evaluator, and val_evaluator
+        log_interval: Iterations between training lines, shared with the
+            TensorBoard curves. Independent of the evaluation interval, which is
+            usually far longer; set to 1 to log every step.
         **kwargs: Additional arguments to pass to setup_logger
 
     Returns:
@@ -106,7 +151,7 @@ def proglogger(objects, steps=False, **kwargs):
         _ctx = {
             "loss_sum": 0.0,
             "loss_count": 0,
-            "epoch_t0": 0.0,
+            "window_t0": 0.0,
             "train_t0": 0.0,
             "eval_t0": 0.0,
             "train_times": [],
@@ -149,124 +194,63 @@ def proglogger(objects, steps=False, **kwargs):
                     logger.info(f"  # Params   : {n_params_m:.2f}M")
                 logger.info("")
 
-        @trainer.on(Events.EPOCH_STARTED)
-        def _on_epoch_start(engine):
+        # One line per log_interval iterations, independent of the evaluation
+        # interval: evaluation is expensive and therefore rare, but training
+        # progress should still be visible in between.
+        every = max(int(log_interval), 1)
+
+        @trainer.on(Events.STARTED)
+        def _open_training_section(engine):
             _ctx["loss_sum"] = 0.0
             _ctx["loss_count"] = 0
-            _ctx["epoch_t0"] = time.time()
-
-            # Log Training section title on first epoch
+            _ctx["window_t0"] = time.time()
             if rank == 0 and not _ctx["training_logged"]:
                 logger.info(make_header("Training"))
                 _ctx["training_logged"] = True
-
-        @trainer.on(Events.ITERATION_STARTED)
-        def _on_step_start(engine):
-            _ctx["step_t0"] = time.time()
 
         @trainer.on(Events.ITERATION_COMPLETED)
         def _accumulate_loss(engine):
             _ctx["loss_sum"] += engine.state.output
             _ctx["loss_count"] += 1
 
-            if steps and rank == 0:
-                epoch = engine.state.epoch
-                max_epochs = engine.state.max_epochs
-                we = len(str(max_epochs))
-                step = engine.state.iteration - (epoch - 1) * len(engine.state.dataloader)
-                total_steps = len(engine.state.dataloader)
-                ws = len(str(total_steps))
-                elapsed = time.time() - _ctx["step_t0"]
-
-                lr = 0.0
-                if "optimizer" in objects:
-                    for param_group in objects["optimizer"].param_groups:
-                        lr = param_group["lr"]
-                        break
-
-                avg_loss = _ctx["loss_sum"] / _ctx["loss_count"]
-                logger.info(
-                    f"[{_ts()}] Train  Epoch {epoch:>{we}}/{max_epochs} "
-                    f" Step {step:>{ws}}/{total_steps} │ "
-                    f"time={_fmt_time(elapsed)} │ lr={lr:.1e} │ loss={avg_loss:.4f}"
-                )
-
-        @trainer.on(Events.EPOCH_COMPLETED)
-        def _log_train_epoch(engine):
-            if rank != 0:
+        @trainer.on(Events.ITERATION_COMPLETED(every=every) | Events.COMPLETED)
+        def _log_train_interval(engine):
+            if rank != 0 or _ctx["loss_count"] == 0:
                 return
-            epoch = engine.state.epoch
-            max_epochs = engine.state.max_epochs
-            w = len(str(max_epochs))
-            avg_loss = _ctx["loss_sum"] / max(_ctx["loss_count"], 1)
-            elapsed = time.time() - _ctx["epoch_t0"]
+            avg_loss = _ctx["loss_sum"] / _ctx["loss_count"]
+            elapsed = time.time() - _ctx["window_t0"]
             _ctx["train_times"].append(elapsed)
 
-            # Get learning rate from optimizer
             lr = 0.0
             if "optimizer" in objects:
-                optimizer = objects["optimizer"]
-                for param_group in optimizer.param_groups:
+                for param_group in objects["optimizer"].param_groups:
                     lr = param_group["lr"]
                     break
 
             logger.info(
-                f"[{_ts()}] Train  Epoch {epoch:>{w}}/{max_epochs} │ "
+                f"[{_ts()}] Train  {_progress(engine.state.iteration, objects)} │ "
                 f"time={_fmt_time(elapsed)} │ lr={lr:.1e} │ loss={avg_loss:.4f}"
             )
+            _ctx["loss_sum"] = 0.0
+            _ctx["loss_count"] = 0
+            _ctx["window_t0"] = time.time()
 
         @train_evaluator.on(Events.STARTED)
         def _eval_start(engine):
             _ctx["eval_t0"] = time.time()
 
-        @train_evaluator.on(Events.ITERATION_STARTED)
-        def _on_train_eval_step_start(engine):
-            _ctx["step_t0"] = time.time()
-
-        @val_evaluator.on(Events.ITERATION_STARTED)
-        def _on_val_eval_step_start(engine):
-            _ctx["step_t0"] = time.time()
-
-        if steps:
-
-            @train_evaluator.on(Events.ITERATION_COMPLETED)
-            def _log_train_eval_step(engine):
-                if rank != 0:
-                    return
-                step = engine.state.iteration
-                total_steps = len(engine.state.dataloader)
-                ws = len(str(total_steps))
-                elapsed = time.time() - _ctx["step_t0"]
-                logger.info(
-                    f"[{_ts()}] Eval   train  Step {step:>{ws}}/{total_steps} │ "
-                    f"time={_fmt_time(elapsed)}"
-                )
-
-            @val_evaluator.on(Events.ITERATION_COMPLETED)
-            def _log_val_eval_step(engine):
-                if rank != 0:
-                    return
-                step = engine.state.iteration
-                total_steps = len(engine.state.dataloader)
-                ws = len(str(total_steps))
-                elapsed = time.time() - _ctx["step_t0"]
-                logger.info(
-                    f"[{_ts()}] Eval   val    Step {step:>{ws}}/{total_steps} │ "
-                    f"time={_fmt_time(elapsed)}"
-                )
-
         @val_evaluator.on(Events.COMPLETED)
         def _log_eval(engine):
             if rank != 0:
                 return
-            epoch = trainer.state.epoch
-            max_epochs = trainer.state.max_epochs
-            w = len(str(max_epochs))
             elapsed = time.time() - _ctx["eval_t0"]
             _ctx["eval_times"].append(elapsed)
 
-            train_n = len(train_evaluator.state.dataloader.dataset)
-            val_n = len(engine.state.dataloader.dataset)
+            # Count what was actually scored, not the dataset size: with
+            # trainer.eval_train_ratio < 1 the train pass covers a subset, and
+            # charging it the full dataset inflates the reported rate severalfold.
+            train_n = _samples_seen(train_evaluator)
+            val_n = _samples_seen(engine)
             speed = (train_n + val_n) / max(elapsed, 1e-6)
             _ctx["eval_speeds"].append(speed)
 
@@ -277,7 +261,7 @@ def proglogger(objects, steps=False, **kwargs):
             )
 
             logger.info(
-                f"[{_ts()}] Eval   Epoch {epoch:>{w}}/{max_epochs} │ "
+                f"[{_ts()}] Eval   {_progress(trainer.state.iteration, objects)} │ "
                 f"time={_fmt_time(elapsed)} │ speed={speed:.1f} samples/s │ {metric_parts}"
             )
             logger.info("")
@@ -296,11 +280,11 @@ def proglogger(objects, steps=False, **kwargs):
                 avg_eval = sum(_ctx["eval_times"]) / len(_ctx["eval_times"])
                 avg_speed = sum(_ctx["eval_speeds"]) / len(_ctx["eval_speeds"])
                 logger.info(
-                    f"  Avg epoch time  : {_fmt_time(avg_train)} (train) / {_fmt_time(avg_eval)} (eval)"
+                    f"  Avg interval    : {_fmt_time(avg_train)} (train) / {_fmt_time(avg_eval)} (eval)"
                 )
                 logger.info(f"  Avg speed       : {avg_speed:.1f} samples/s")
             else:
-                logger.info(f"  Avg epoch time  : {_fmt_time(avg_train)} (train)")
+                logger.info(f"  Avg interval    : {_fmt_time(avg_train)} (train)")
             logger.info("")
 
     # --- Evaluation only ---
@@ -339,9 +323,11 @@ def proglogger(objects, steps=False, **kwargs):
         def _on_eval_step_start(engine):
             _eval_ctx["step_t0"] = time.time()
 
-        if steps:
+        # A standalone evaluation is a single pass, so there is no natural
+        # interval -- only log progress if one was asked for explicitly.
+        if log_interval:
 
-            @evaluator.on(Events.ITERATION_COMPLETED)
+            @evaluator.on(Events.ITERATION_COMPLETED(every=int(log_interval)))
             def _log_eval_step(engine):
                 if rank != 0:
                     return

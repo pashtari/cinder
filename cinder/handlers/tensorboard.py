@@ -1,7 +1,12 @@
 import ignite.distributed as idist
 import torch
-from ignite.contrib.engines import common
 from ignite.engine import Events
+from ignite.handlers import global_step_from_engine
+
+try:  # ignite >= 0.5
+    from ignite.handlers.tensorboard_logger import TensorboardLogger
+except ModuleNotFoundError:  # ignite < 0.5
+    from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger
 
 # Qualitative palette (RGB in [0, 1]); index 0 is background (black), 1 is white.
 # Used to colorize multi-class label maps; binary masks use index 0/1 only.
@@ -61,7 +66,8 @@ def _attach_image_logging(tb_logger, trainer, evaluator, num_examples: int) -> N
 
     Captures the (fixed, since the val loader is unshuffled) first few cases of
     each evaluation run and writes them under per-example tags stepped by the
-    training epoch, so the TensorBoard image slider shows each case evolving.
+    training iteration, so the TensorBoard image slider shows each case evolving
+    on the same axis as the scalar curves.
     """
     buffer: list[torch.Tensor] = []
 
@@ -84,7 +90,7 @@ def _attach_image_logging(tb_logger, trainer, evaluator, num_examples: int) -> N
 
     @evaluator.on(Events.EPOCH_COMPLETED)
     def _write(_engine) -> None:
-        step = trainer.state.epoch
+        step = trainer.state.iteration
         for i, panel in enumerate(buffer):
             tb_logger.writer.add_image(f"val/example_{i}", panel, global_step=step)
 
@@ -94,6 +100,7 @@ def tensorboard(
     output_path="./",
     log_images=True,
     num_examples=2,
+    log_interval=50,
     **kwargs,
 ):
     rank = idist.get_rank()
@@ -108,13 +115,34 @@ def tensorboard(
         "val": objects["val_evaluator"],
     }
 
-    tb_logger = common.setup_tb_logging(
-        output_path,
-        trainer=trainer,
-        optimizers=optimizer,
-        evaluators=evaluators,
-        **kwargs,
+    # Attached by hand rather than through ignite's common.setup_tb_logging,
+    # which steps evaluator metrics by the trainer's *epoch*. An epoch here is
+    # one evaluation interval, so validation curves would be plotted against
+    # 1, 2, 3... Everything below is on the iteration axis instead, which is
+    # also the unit the training budget is expressed in.
+    tb_logger = TensorboardLogger(log_dir=output_path, **kwargs)
+
+    tb_logger.attach_output_handler(
+        trainer,
+        event_name=Events.ITERATION_COMPLETED(every=log_interval),
+        tag="train",
+        output_transform=lambda loss: {"loss": loss},
     )
+    tb_logger.attach_opt_params_handler(
+        trainer,
+        event_name=Events.ITERATION_COMPLETED(every=log_interval),
+        optimizer=optimizer,
+    )
+    for tag, evaluator in evaluators.items():
+        tb_logger.attach_output_handler(
+            evaluator,
+            event_name=Events.COMPLETED,
+            tag=tag,
+            metric_names="all",
+            global_step_transform=global_step_from_engine(
+                trainer, Events.ITERATION_COMPLETED
+            ),
+        )
 
     # Log a few qualitative val examples (input / ground truth / prediction)
     # after each evaluation.
