@@ -48,6 +48,25 @@ except ImportError:  # CPU-only build: RCSMatrix falls back to CSR / gather+bmm
 
 __all__ = ["RCSMatrix"]
 
+
+# torch 2.4 moved the custom autograd-under-autocast helpers from torch.cuda.amp
+# to torch.amp and gave the autocast queries an explicit device argument. Both
+# spellings are needed: HPC-UGent's newest CUDA-matched build is torch 2.1.
+if hasattr(torch.amp, "custom_fwd"):
+    _custom_fwd = torch.amp.custom_fwd(device_type="cuda")
+    _custom_bwd = torch.amp.custom_bwd(device_type="cuda")
+
+    def _autocast_enabled() -> bool:
+        return torch.is_autocast_enabled("cuda")
+
+    def _autocast_dtype() -> torch.dtype:
+        return torch.get_autocast_dtype("cuda")
+else:  # torch < 2.4
+    _custom_fwd = torch.cuda.amp.custom_fwd
+    _custom_bwd = torch.cuda.amp.custom_bwd
+    _autocast_enabled = torch.is_autocast_enabled
+    _autocast_dtype = torch.get_autocast_gpu_dtype
+
 _MATMUL_FUNCS = {
     torch.matmul,
     torch.mm,
@@ -314,7 +333,7 @@ if triton is not None:
         """
 
         @staticmethod
-        @torch.amp.custom_fwd(device_type="cuda")
+        @_custom_fwd
         def forward(ctx, values: Tensor, col_start: Tensor, B: Tensor, cache=None):
             if not (values.is_cuda and B.is_cuda and col_start.is_cuda):
                 raise RuntimeError("triton RCS matmul requires CUDA tensors")
@@ -323,8 +342,8 @@ if triton is not None:
             # Emulate autocast's handling of matmul: fp32 operands compute in
             # the autocast dtype (fp64 and explicit low-precision inputs are
             # left alone, as autocast would).
-            if compute_dtype == torch.float32 and torch.is_autocast_enabled("cuda"):
-                compute_dtype = torch.get_autocast_dtype("cuda")
+            if compute_dtype == torch.float32 and _autocast_enabled():
+                compute_dtype = _autocast_dtype()
 
             col_start = col_start.to(torch.long).contiguous()
             out = _launch_forward(values.to(compute_dtype), col_start, B.to(compute_dtype))
@@ -339,7 +358,7 @@ if triton is not None:
             return out
 
         @staticmethod
-        @torch.amp.custom_bwd(device_type="cuda")
+        @_custom_bwd
         def backward(ctx, grad_out: Tensor):
             values, col_start, B = ctx.saved_tensors
             need_values, _, need_b = ctx.needs_input_grad[:3]

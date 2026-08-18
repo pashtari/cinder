@@ -267,7 +267,7 @@ class _LocalBasis(_Basis):
     measured in grid-index units. The kernel vanishes outside :math:`|t| < a`,
     where :attr:`bandwidth` ``= a`` is its radius in grid steps, hence at most
     ``2a`` *consecutive* centers are nonzero: exactly the row-contiguous
-    sparse pattern of :class:`~neurofield.models.RCSMatrix`. Subclasses
+    sparse pattern of :class:`RCSMatrix`. Subclasses
     implement :meth:`_kernel`.
 
     Sparse mode:
@@ -692,16 +692,26 @@ class Conditioner(nn.Module):
                 f"coordinates, got shape {tuple(z.shape)}"
             )
         batch, features = z.shape[:2]
+        # grid_sample has no bfloat16 CUDA kernel (as of torch 2.1), so under
+        # autocast the interpolation is done in fp32 and cast back. It is a
+        # gather with bilinear weights, not a matmul, so nothing is gained by
+        # running it in low precision anyway.
+        out_dtype = z.dtype
+        if torch.is_autocast_enabled() and z.is_cuda:
+            z = z.float()
         # grid_sample reads the last axis as (x, y[, z]) -- the reverse of the
         # "ij" coordinate order -- and wants a grid shaped like its output, so
         # the queries are flattened onto a single sampling axis.
         grid = x.flip(-1).reshape(-1, *(1,) * (x.shape[-1] - 1), x.shape[-1])
         grid = grid.to(z.dtype).expand(batch, *grid.shape)
-        sampled = F.grid_sample(
-            z, grid, mode="bilinear", padding_mode="border", align_corners=True
-        )
-        return sampled.reshape(batch, features, -1).mT.reshape(
-            batch, *x.shape[:-1], features
+        with torch.autocast(device_type="cuda", enabled=False):
+            sampled = F.grid_sample(
+                z, grid, mode="bilinear", padding_mode="border", align_corners=True
+            )
+        return (
+            sampled.reshape(batch, features, -1)
+            .mT.reshape(batch, *x.shape[:-1], features)
+            .to(out_dtype)
         )
 
     def forward(self, x: Tensor, features: Tensor, z: Tensor) -> Tensor:
