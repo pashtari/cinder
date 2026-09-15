@@ -1,41 +1,17 @@
-"""Row-contiguous sparse (RCS) matrices.
+"""Row-contiguous sparse matrices with compact dense multiplication.
 
-An RCS matrix is an ``M x N`` sparse matrix in which the non-zero elements of
-each row form a contiguous segment of length at most ``L``. It is stored
-compactly as a dense ``(M, L)`` matrix of segment values and an ``(M,)``
-integer vector of segment start columns, and multiplies dense matrices
-directly in this compact form.
+An ``(M, N)`` matrix stores at most L consecutive entries per row as
+``values (M, L)`` and ``start_cols (M,)``. CUDA products use Triton kernels
+with a deterministic first-order backward; higher-order derivatives use
+differentiable PyTorch operations. Fallback products use CSR where supported or
+a differentiable gather-and-contract path.
 
-On CUDA the product ``A @ B`` is backed by three Triton kernels wrapped in a
-``torch.autograd.Function`` (:class:`RCSMatmulFn`):
-
-- forward:  ``out[i, k] = sum_l values[i, l] * B[col_start_i + l, k]``;
-  2D grid over (M-blocks, K-blocks), ``l`` loop unrolled over constexpr
-  ``L``, gathered rows of ``B``, fp32 accumulator (fp64 for double inputs).
-- grad_values: 1D grid over M-blocks; each ``grad_out`` tile is loaded once
-  and reused for all ``L`` row-dot accumulators, so ``grad_out`` is streamed
-  from DRAM exactly once.
-- grad_B: atomic-free segmented reduction over a precomputed transpose
-  structure. ``col_start`` is static per matrix, so the stable sort of the
-  flattened column targets (:func:`_build_transpose_cache`) is done once and
-  reused every backward; each program owns one ``grad_B`` row and K-tile and
-  walks its contributor segment in a fixed order, so the result is
-  **bit-deterministic** across runs.
-
-First-order backward uses the kernels. When autograd runs backward under
-grad mode (``create_graph=True``), the backward switches to a pure-torch
-differentiable formulation, so second derivatives are exact and supported.
-Under CUDA autocast, fp32 operands are computed in the autocast dtype
-(matching what autocast does to ``torch.bmm``) and gradients are cast back.
-``L`` is a compile-time constant per kernel specialization; very large ``L``
-(hundreds) inflates compile time because the ``l`` loops are fully unrolled.
-
-Without triton (e.g. a CPU-only build), :class:`RCSMatrix` falls back to a
-sparse CSR kernel outside autograd and to a differentiable gather-and-contract
-path under autograd.
+Triton unrolls the L taps at compile time, so large segments increase
+compilation cost. Accumulation uses float32, or float64 for double inputs.
 """
 
 import copy
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -43,15 +19,13 @@ from torch import Tensor
 try:
     import triton
     import triton.language as tl
-except ImportError:  # CPU-only build: RCSMatrix falls back to CSR / gather+bmm
+except ImportError:
     triton = None
 
 __all__ = ["RCSMatrix"]
 
 
-# torch 2.4 moved the custom autograd-under-autocast helpers from torch.cuda.amp
-# to torch.amp and gave the autocast queries an explicit device argument. Both
-# spellings are needed: HPC-UGent's newest CUDA-matched build is torch 2.1.
+# Support both AMP APIs: torch.amp added these helpers in PyTorch 2.4.
 if hasattr(torch.amp, "custom_fwd"):
     _custom_fwd = torch.amp.custom_fwd(device_type="cuda")
     _custom_bwd = torch.amp.custom_bwd(device_type="cuda")
@@ -61,11 +35,16 @@ if hasattr(torch.amp, "custom_fwd"):
 
     def _autocast_dtype() -> torch.dtype:
         return torch.get_autocast_dtype("cuda")
+
+    def _cpu_autocast_enabled() -> bool:
+        return torch.is_autocast_enabled("cpu")
+
 else:  # torch < 2.4
     _custom_fwd = torch.cuda.amp.custom_fwd
     _custom_bwd = torch.cuda.amp.custom_bwd
     _autocast_enabled = torch.is_autocast_enabled
     _autocast_dtype = torch.get_autocast_gpu_dtype
+    _cpu_autocast_enabled = torch.is_autocast_cpu_enabled
 
 _MATMUL_FUNCS = {
     torch.matmul,
@@ -76,33 +55,33 @@ _MATMUL_FUNCS = {
 }
 
 
-def _build_transpose_cache(col_start: Tensor, L: int, N: int):
-    """One-time transpose structure of the static sparsity pattern.
+def _build_transpose_cache(
+    start_cols: Tensor, num_taps: int, num_cols: int
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Group stored entries by column for deterministic gradient reduction.
 
-    Stable sort of the flattened column targets ``J_i + l``; returns
-    ``(rowptr (N+1,) int64, src_i (M*L,) int32, src_l (M*L,) int32)`` on
-    ``col_start``'s device. Requires ``L > 0``.
+    Returns row pointers ``(N+1,)`` and source row/tap indices ``(M*L,)``.
+    The stable sort fixes summation order. Requires ``num_taps > 0``.
     """
-    device = col_start.device
-    j = col_start.to(torch.long).reshape(-1)
-    flat = (j[:, None] + torch.arange(L, device=device, dtype=torch.long)).reshape(-1)
-    perm = torch.argsort(flat, stable=True)
-    rowptr = torch.searchsorted(
-        flat[perm], torch.arange(N + 1, device=device, dtype=torch.long)
+    device = start_cols.device
+    starts = start_cols.to(torch.long).reshape(-1)
+    columns = (
+        starts[:, None] + torch.arange(num_taps, device=device, dtype=torch.long)
+    ).reshape(-1)
+    order = torch.argsort(columns, stable=True)
+    row_offsets = torch.searchsorted(
+        columns[order], torch.arange(num_cols + 1, device=device, dtype=torch.long)
     )
     return (
-        rowptr.contiguous(),
-        (perm // L).to(torch.int32).contiguous(),
-        (perm % L).to(torch.int32).contiguous(),
+        row_offsets.contiguous(),
+        (order // num_taps).to(torch.int32).contiguous(),
+        (order % num_taps).to(torch.int32).contiguous(),
     )
 
 
 if triton is not None:
-
-    # Tiny autotune space: the tile aspect ratio is the only knob that matters
-    # much for this memory-bound gather kernel. Keyed on (K, L) so first-call
-    # overhead stays low. Safe to autotune: replaying the forward only rewrites
-    # the same output tile (the backward kernels are NOT autotuned).
+    # Tune tile shape with low first-call overhead. Forward replay only overwrites
+    # its output, so autotuning needs no reset; backward kernels are not autotuned.
     _FWD_CONFIGS = [
         triton.Config({"BLOCK_M": 32, "BLOCK_K": 128}, num_warps=4),
         triton.Config({"BLOCK_M": 64, "BLOCK_K": 64}, num_warps=4),
@@ -112,11 +91,18 @@ if triton is not None:
     @triton.autotune(configs=_FWD_CONFIGS, key=["K", "L"])
     @triton.jit
     def _rcs_fwd_kernel(
-        g_ptr, j_ptr, b_ptr, out_ptr,
-        M, K,
-        stride_gm, stride_gl,
-        stride_bn, stride_bk,
-        stride_om, stride_ok,
+        g_ptr,
+        j_ptr,
+        b_ptr,
+        out_ptr,
+        M,
+        K,
+        stride_gm,
+        stride_gl,
+        stride_bn,
+        stride_bk,
+        stride_om,
+        stride_ok,
         L: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -134,10 +120,12 @@ if triton is not None:
         j = tl.load(j_ptr + rm, mask=mask_m, other=0)
 
         acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=ACC_DTYPE)
-        for l in tl.static_range(L):
-            g = tl.load(g_ptr + rm * stride_gm + l * stride_gl, mask=mask_m, other=0.0)
+        for tap in tl.static_range(L):
+            g = tl.load(
+                g_ptr + rm * stride_gm + tap * stride_gl, mask=mask_m, other=0.0
+            )
             b = tl.load(
-                b_ptr + (j + l)[:, None] * stride_bn + rk[None, :] * stride_bk,
+                b_ptr + (j + tap)[:, None] * stride_bn + rk[None, :] * stride_bk,
                 mask=mask,
                 other=0.0,
             )
@@ -151,23 +139,25 @@ if triton is not None:
 
     @triton.jit
     def _rcs_bwd_g_kernel(
-        go_ptr, j_ptr, b_ptr, gg_ptr,
-        M, K,
-        stride_gom, stride_gok,
-        stride_bn, stride_bk,
-        stride_ggm, stride_ggl,
+        go_ptr,
+        j_ptr,
+        b_ptr,
+        gg_ptr,
+        M,
+        K,
+        stride_gom,
+        stride_gok,
+        stride_bn,
+        stride_bk,
+        stride_ggm,
+        stride_ggl,
         L: tl.constexpr,
         L_P2: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_K: tl.constexpr,
         ACC_DTYPE: tl.constexpr,
     ):
-        """grad_G[i, l] = dot(grad_out[i, :], B[J_i + l, :]); grid = (M-blocks,).
-
-        Each grad_out tile is loaded once and reused for all L accumulators
-        (a (BLOCK_M, L_P2) register accumulator updated via a constexpr one-hot
-        select, which compiles to a predicated register move).
-        """
+        """Reuse each grad_out tile across all L row-dot-product accumulators."""
         pid_m = tl.program_id(0)
         rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_m = rm < M
@@ -202,21 +192,24 @@ if triton is not None:
 
     @triton.jit
     def _rcs_bwd_b_kernel(
-        rowptr_ptr, srci_ptr, srcl_ptr,
-        g_ptr, go_ptr, gb_ptr,
+        rowptr_ptr,
+        srci_ptr,
+        srcl_ptr,
+        g_ptr,
+        go_ptr,
+        gb_ptr,
         K,
-        stride_gm, stride_gl,
-        stride_gom, stride_gok,
-        stride_gbn, stride_gbk,
+        stride_gm,
+        stride_gl,
+        stride_gom,
+        stride_gok,
+        stride_gbn,
+        stride_gbk,
         BLOCK_E: tl.constexpr,
         BLOCK_K: tl.constexpr,
         ACC_DTYPE: tl.constexpr,
     ):
-        """grad_B[j, k_tile] = sum over segment rowptr[j]..rowptr[j+1] of
-        G[src_i, src_l] * grad_out[src_i, k_tile].
-
-        One program per (j, K-tile); fixed traversal order => deterministic.
-        """
+        """Reduce each column's contributors in fixed order for determinism."""
         j = tl.program_id(0)
         pid_k = tl.program_id(1)
         rk = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -231,9 +224,9 @@ if triton is not None:
             re = p0 + tl.arange(0, BLOCK_E)
             mask_e = re < end
             i = tl.load(srci_ptr + re, mask=mask_e, other=0).to(tl.int64)
-            l = tl.load(srcl_ptr + re, mask=mask_e, other=0).to(tl.int64)
+            tap = tl.load(srcl_ptr + re, mask=mask_e, other=0).to(tl.int64)
             g = tl.load(
-                g_ptr + i * stride_gm + l * stride_gl, mask=mask_e, other=0.0
+                g_ptr + i * stride_gm + tap * stride_gl, mask=mask_e, other=0.0
             ).to(ACC_DTYPE)
             go = tl.load(
                 go_ptr + i[:, None] * stride_gom + rk[None, :] * stride_gok,
@@ -248,203 +241,254 @@ if triton is not None:
             mask=mask_k,
         )
 
-    def _acc_tl_dtype(dtype: torch.dtype):
+    def _acc_tl_dtype(dtype: torch.dtype) -> tl.dtype:
         return tl.float64 if dtype == torch.float64 else tl.float32
 
-    def _launch_forward(values, col_start, B):
-        M, L = values.shape
-        K = B.shape[1]
-        out = torch.empty(M, K, dtype=values.dtype, device=values.device)
-        if M == 0 or K == 0:
+    def _launch_forward(values: Tensor, start_cols: Tensor, other: Tensor) -> Tensor:
+        num_rows, num_taps = values.shape
+        out_features = other.shape[1]
+        out = torch.empty(
+            num_rows, out_features, dtype=values.dtype, device=values.device
+        )
+        if num_rows == 0 or out_features == 0:
             return out
-        if L == 0:
+        if num_taps == 0:
             return out.zero_()
-        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(K, meta["BLOCK_K"]))
+
+        def grid(meta):
+            return (
+                triton.cdiv(num_rows, meta["BLOCK_M"]),
+                triton.cdiv(out_features, meta["BLOCK_K"]),
+            )
+
         _rcs_fwd_kernel[grid](
-            values, col_start, B, out,
-            M, K,
-            values.stride(0), values.stride(1),
-            B.stride(0), B.stride(1),
-            out.stride(0), out.stride(1),
-            L=L, ACC_DTYPE=_acc_tl_dtype(values.dtype),
+            values,
+            start_cols,
+            other,
+            out,
+            num_rows,
+            out_features,
+            values.stride(0),
+            values.stride(1),
+            other.stride(0),
+            other.stride(1),
+            out.stride(0),
+            out.stride(1),
+            L=num_taps,
+            ACC_DTYPE=_acc_tl_dtype(values.dtype),
         )
         return out
 
-    def _launch_grad_g(grad_out, col_start, B, M, L):
-        K = grad_out.shape[1]
-        grad_g = torch.empty(M, L, dtype=grad_out.dtype, device=grad_out.device)
-        if M == 0 or L == 0:
-            return grad_g
-        if K == 0:
-            return grad_g.zero_()
-        BLOCK_K = min(128, triton.next_power_of_2(K))
-        grid = (triton.cdiv(M, 16),)
+    def _launch_grad_values(
+        grad_out: Tensor,
+        start_cols: Tensor,
+        other: Tensor,
+        num_rows: int,
+        num_taps: int,
+    ) -> Tensor:
+        out_features = grad_out.shape[1]
+        grad_values = torch.empty(
+            num_rows, num_taps, dtype=grad_out.dtype, device=grad_out.device
+        )
+        if num_rows == 0 or num_taps == 0:
+            return grad_values
+        if out_features == 0:
+            return grad_values.zero_()
+        block_k = min(128, triton.next_power_of_2(out_features))
+        grid = (triton.cdiv(num_rows, 16),)
         _rcs_bwd_g_kernel[grid](
-            grad_out, col_start, B, grad_g,
-            M, K,
-            grad_out.stride(0), grad_out.stride(1),
-            B.stride(0), B.stride(1),
-            grad_g.stride(0), grad_g.stride(1),
-            L=L, L_P2=triton.next_power_of_2(L),
-            BLOCK_M=16, BLOCK_K=BLOCK_K,
+            grad_out,
+            start_cols,
+            other,
+            grad_values,
+            num_rows,
+            out_features,
+            grad_out.stride(0),
+            grad_out.stride(1),
+            other.stride(0),
+            other.stride(1),
+            grad_values.stride(0),
+            grad_values.stride(1),
+            L=num_taps,
+            L_P2=triton.next_power_of_2(num_taps),
+            BLOCK_M=16,
+            BLOCK_K=block_k,
             ACC_DTYPE=_acc_tl_dtype(grad_out.dtype),
             num_warps=4,
         )
-        return grad_g
+        return grad_values
 
-    def _launch_grad_b(values, cache, grad_out, N):
-        """Deterministic segmented-reduction grad_B.
-
-        Returns grad_B in the fp32/fp64 accumulation dtype (caller casts).
-        """
-        M, L = values.shape
-        K = grad_out.shape[1]
+    def _launch_grad_other(
+        values: Tensor,
+        cache: tuple[Tensor, Tensor, Tensor] | None,
+        grad_out: Tensor,
+        num_cols: int,
+    ) -> Tensor:
+        """Reduce the dense operand's gradient in float32/float64; the caller casts."""
+        num_rows, num_taps = values.shape
+        out_features = grad_out.shape[1]
         acc_dtype = torch.float64 if values.dtype == torch.float64 else torch.float32
-        if M == 0 or K == 0 or L == 0 or N == 0:
-            return torch.zeros(N, K, dtype=acc_dtype, device=values.device)
-        rowptr, src_i, src_l = cache
-        grad_b = torch.empty(N, K, dtype=acc_dtype, device=values.device)
-        BLOCK_K = min(128, triton.next_power_of_2(K))
-        grid = (N, triton.cdiv(K, BLOCK_K))
+        if num_rows == 0 or out_features == 0 or num_taps == 0 or num_cols == 0:
+            return torch.zeros(
+                num_cols, out_features, dtype=acc_dtype, device=values.device
+            )
+        row_offsets, source_rows, source_taps = cache
+        grad_other = torch.empty(
+            num_cols, out_features, dtype=acc_dtype, device=values.device
+        )
+        block_k = min(128, triton.next_power_of_2(out_features))
+        grid = (num_cols, triton.cdiv(out_features, block_k))
         _rcs_bwd_b_kernel[grid](
-            rowptr, src_i, src_l,
-            values, grad_out, grad_b,
-            K,
-            values.stride(0), values.stride(1),
-            grad_out.stride(0), grad_out.stride(1),
-            grad_b.stride(0), grad_b.stride(1),
-            BLOCK_E=32, BLOCK_K=BLOCK_K,
+            row_offsets,
+            source_rows,
+            source_taps,
+            values,
+            grad_out,
+            grad_other,
+            out_features,
+            values.stride(0),
+            values.stride(1),
+            grad_out.stride(0),
+            grad_out.stride(1),
+            grad_other.stride(0),
+            grad_other.stride(1),
+            BLOCK_E=32,
+            BLOCK_K=block_k,
             ACC_DTYPE=_acc_tl_dtype(acc_dtype),
             num_warps=4,
         )
-        return grad_b
+        return grad_other
 
     class RCSMatmulFn(torch.autograd.Function):
-        """``out = RCS(values, col_start) @ B`` with Triton forward and backward.
+        """Triton product with a differentiable path for higher-order gradients.
 
-        ``cache`` is the optional transpose structure from
-        :func:`_build_transpose_cache` (built on the fly if omitted and grad_B
-        is needed; RCSMatrix passes its per-instance cache). Gradients flow to
-        ``values`` and ``B`` (only those requested via ``needs_input_grad``
-        are computed) and are bit-deterministic. First-order backward uses
-        Triton kernels; backward under grad mode (``create_graph=True``) uses
-        a differentiable pure-torch formulation, so double backward is
-        supported.
+        ``cache`` groups entries by column for a deterministic dense gradient.
+        RCSMatrix reuses it across products; otherwise it is built on demand.
         """
 
         @staticmethod
         @_custom_fwd
-        def forward(ctx, values: Tensor, col_start: Tensor, B: Tensor, cache=None):
-            if not (values.is_cuda and B.is_cuda and col_start.is_cuda):
+        def forward(
+            ctx,
+            values: Tensor,
+            start_cols: Tensor,
+            other: Tensor,
+            cache: tuple[Tensor, Tensor, Tensor] | None = None,
+        ) -> Tensor:
+            if not (values.is_cuda and other.is_cuda and start_cols.is_cuda):
                 raise RuntimeError("triton RCS matmul requires CUDA tensors")
 
-            compute_dtype = torch.promote_types(values.dtype, B.dtype)
-            # Emulate autocast's handling of matmul: fp32 operands compute in
-            # the autocast dtype (fp64 and explicit low-precision inputs are
-            # left alone, as autocast would).
+            compute_dtype = torch.promote_types(values.dtype, other.dtype)
+            # Match matmul autocast while preserving explicit low/double precision.
             if compute_dtype == torch.float32 and _autocast_enabled():
                 compute_dtype = _autocast_dtype()
 
-            col_start = col_start.to(torch.long).contiguous()
-            out = _launch_forward(values.to(compute_dtype), col_start, B.to(compute_dtype))
+            start_cols = start_cols.to(torch.long).contiguous()
+            out = _launch_forward(
+                values.to(compute_dtype), start_cols, other.to(compute_dtype)
+            )
 
-            # Save the ORIGINAL operands: in the common (equal-dtype,
-            # no-autocast) case the casts above are no-ops, and the
-            # differentiable backward branch re-applies them under grad mode
-            # so the graph stays connected.
-            ctx.save_for_backward(values, col_start, B)
+            # Keep original operands so backward can differentiate through casts.
+            ctx.save_for_backward(values, start_cols, other)
             ctx.compute_dtype = compute_dtype
             ctx.cache = cache
             return out
 
         @staticmethod
         @_custom_bwd
-        def backward(ctx, grad_out: Tensor):
-            values, col_start, B = ctx.saved_tensors
-            need_values, _, need_b = ctx.needs_input_grad[:3]
-            M, L = values.shape
-            N = B.shape[0]
-            grad_values = grad_b = None
+        def backward(
+            ctx, grad_out: Tensor
+        ) -> tuple[Tensor | None, None, Tensor | None, None]:
+            values, start_cols, other = ctx.saved_tensors
+            needs_values_grad, _, needs_other_grad = ctx.needs_input_grad[:3]
+            num_rows, num_taps = values.shape
+            num_cols = other.shape[0]
+            grad_values = grad_other = None
 
             if torch.is_grad_enabled():
-                # create_graph=True: differentiable formulation for exact
-                # second derivatives.
-                idx = col_start[:, None] + torch.arange(L, device=col_start.device)
-                values_c = values.to(grad_out.dtype)
-                B_c = B.to(grad_out.dtype)
-                if need_values:
-                    grad_values = (grad_out.unsqueeze(1) * B_c[idx]).sum(-1).to(values.dtype)
-                if need_b:
-                    src = (values_c.unsqueeze(-1) * grad_out.unsqueeze(1)).reshape(M * L, -1)
-                    grad_b = (
-                        torch.zeros_like(B_c).index_add_(0, idx.reshape(-1), src).to(B.dtype)
+                # Build a graph through backward for higher-order derivatives.
+                column_indices = start_cols[:, None] + torch.arange(
+                    num_taps, device=start_cols.device
+                )
+                cast_values = values.to(grad_out.dtype)
+                cast_other = other.to(grad_out.dtype)
+                if needs_values_grad:
+                    grad_values = (
+                        (grad_out.unsqueeze(1) * cast_other[column_indices])
+                        .sum(-1)
+                        .to(values.dtype)
                     )
-                return grad_values, None, grad_b, None
+                if needs_other_grad:
+                    contributions = (
+                        cast_values.unsqueeze(-1) * grad_out.unsqueeze(1)
+                    ).reshape(num_rows * num_taps, grad_out.shape[1])
+                    grad_other = (
+                        torch.zeros_like(cast_other)
+                        .index_add_(0, column_indices.reshape(-1), contributions)
+                        .to(other.dtype)
+                    )
+                return grad_values, None, grad_other, None
 
             compute_dtype = ctx.compute_dtype
-            go = grad_out.to(compute_dtype)
-            if need_values:
-                grad_values = _launch_grad_g(go, col_start, B.to(compute_dtype), M, L)
+            cast_grad = grad_out.to(compute_dtype)
+            if needs_values_grad:
+                grad_values = _launch_grad_values(
+                    cast_grad, start_cols, other.to(compute_dtype), num_rows, num_taps
+                )
                 grad_values = grad_values.to(values.dtype)
-            if need_b:
+            if needs_other_grad:
                 cache = ctx.cache
-                if cache is None and L > 0:
-                    cache = _build_transpose_cache(col_start, L, N)
-                grad_b = _launch_grad_b(values.to(compute_dtype), cache, go, N)
-                grad_b = grad_b.to(B.dtype)
-            return grad_values, None, grad_b, None
+                if cache is None and num_taps > 0:
+                    cache = _build_transpose_cache(start_cols, num_taps, num_cols)
+                grad_other = _launch_grad_other(
+                    values.to(compute_dtype), cache, cast_grad, num_cols
+                )
+                grad_other = grad_other.to(other.dtype)
+            return grad_values, None, grad_other, None
 
-    def rcs_mm(values: Tensor, col_start: Tensor, B: Tensor, cache=None) -> Tensor:
-        """``RCS(values, col_start) @ B`` for dense ``(N, K)`` or vector ``(N,)`` B."""
-        if B.ndim == 1:
-            return RCSMatmulFn.apply(values, col_start, B.unsqueeze(1), cache).squeeze(1)
-        return RCSMatmulFn.apply(values, col_start, B, cache)
+    def rcs_mm(
+        values: Tensor,
+        start_cols: Tensor,
+        other: Tensor,
+        cache: tuple[Tensor, Tensor, Tensor] | None = None,
+    ) -> Tensor:
+        """Multiply the compact matrix by a dense ``(N, K)`` matrix or ``(N,)`` vector."""
+        if other.ndim == 1:
+            return RCSMatmulFn.apply(
+                values, start_cols, other.unsqueeze(1), cache
+            ).squeeze(1)
+        return RCSMatmulFn.apply(values, start_cols, other, cache)
 
 else:
-    RCSMatmulFn = None
     rcs_mm = None
 
 
 class RCSMatrix(torch.Tensor):
-    """Row-contiguous sparse matrix stored in compact form.
+    """Sparse matrix with one fixed-width segment of stored values per row.
 
-    Represents an ``M x N`` matrix whose row ``i`` is zero except for the
-    ``L`` consecutive entries starting at column ``start_cols[i]``, whose
-    values are ``values[i]``. Rows with fewer than ``L`` non-zeros are
-    zero-padded within their segment.
-
-    The dense matrix is never materialized: a product ``A @ B`` with a dense
-    ``(N, K)`` matrix (or ``(N,)`` vector) runs on the compact representation
-    in ``O(M L K)`` time and memory instead of ``O(M N K)``. On CUDA the
-    product uses the fused Triton kernels defined in this module; without
-    triton it falls back to a sparse CSR kernel outside autograd and to a
-    differentiable gather-and-contract path under autograd. The product is
-    differentiable, with gradients flowing to ``values`` and ``B``, and
-    accepts tensor subclasses such as ``nn.Parameter`` on the right-hand
-    side. ``pickle`` and ``copy.deepcopy`` round-trip the compact form. Any
-    other tensor operation on the matrix raises ``NotImplementedError``;
-    convert with :meth:`to_dense` first.
-
-    If ``values`` is swapped to another device in place (as ``module.cuda()``
-    does to an ``nn.Parameter``), products and :meth:`to_dense` follow the
-    device of ``values``; the wrapper's ``.device`` metadata keeps reporting
-    the construction-time device.
+    ``matrix @ other`` accepts a dense matrix or vector, with gradients to
+    both operands and support for higher-order derivatives. Other tensor
+    operations require :meth:`to_dense`. Deep copying preserves compact storage.
 
     Args:
-        values: Non-zero segment values ``G``, of shape ``(M, L)``.
-        start_cols: Integer start column ``J`` of each row's segment, of shape
-            ``(M,)``, with ``0 <= start_cols[i] <= N - L``. Copied at
-            construction; later in-place changes to the argument are ignored.
-        num_cols: Number of columns ``N`` of the represented matrix.
+        values: Segment values of shape ``(M, L)``, padded with zeros as needed.
+        start_cols: Integer start column per row, shape ``(M,)``, with
+            ``0 <= start_cols[i] <= num_cols - L``. Copied at construction.
+        num_cols: Number of columns in the represented matrix.
+
+    If ``values`` moves to another device in place, computation follows it,
+    but the wrapper's ``device`` metadata retains its construction-time value.
     """
 
     values: Tensor
     start_cols: Tensor
 
     @staticmethod
-    def __new__(cls, values: Tensor, start_cols: Tensor, num_cols: int):
+    def __new__(cls, values: Tensor, start_cols: Tensor, num_cols: int) -> "RCSMatrix":
         if values.ndim != 2:
-            raise ValueError(f"values must have shape (M, L), got {tuple(values.shape)}")
+            raise ValueError(
+                f"values must have shape (M, L), got {tuple(values.shape)}"
+            )
         if num_cols < 0:
             raise ValueError(f"num_cols must be non-negative, got {num_cols}")
         return torch.Tensor._make_wrapper_subclass(
@@ -455,35 +499,39 @@ class RCSMatrix(torch.Tensor):
             requires_grad=values.requires_grad,
         )
 
-    def __init__(self, values: Tensor, start_cols: Tensor, num_cols: int):
-        M, L = values.shape
-        if start_cols.shape != (M,):
+    def __init__(self, values: Tensor, start_cols: Tensor, num_cols: int) -> None:
+        num_rows, num_taps = values.shape
+        if start_cols.shape != (num_rows,):
             raise ValueError(
-                f"start_cols must have shape ({M},), got {tuple(start_cols.shape)}"
+                f"start_cols must have shape ({num_rows},), got {tuple(start_cols.shape)}"
             )
         if (
             start_cols.dtype.is_floating_point
             or start_cols.dtype.is_complex
             or start_cols.dtype == torch.bool
         ):
-            raise ValueError(f"start_cols must be an integer tensor, got {start_cols.dtype}")
+            raise ValueError(
+                f"start_cols must be an integer tensor, got {start_cols.dtype}"
+            )
         start_cols = start_cols.to(device=values.device, dtype=torch.long, copy=True)
-        # Single fused check: one host-device sync on CUDA instead of two.
-        if M > 0 and bool(((start_cols < 0) | (start_cols + L > num_cols)).any()):
-            raise ValueError(f"start_cols must lie in [0, {num_cols - L}] for L={L}, N={num_cols}")
+        # Combine bounds checks to avoid a second host-device sync on CUDA.
+        if num_rows > 0 and bool(
+            ((start_cols < 0) | (start_cols + num_taps > num_cols)).any()
+        ):
+            raise ValueError(
+                f"start_cols must lie in [0, {num_cols - num_taps}] for L={num_taps}, N={num_cols}"
+            )
 
         self.values = values
         self.start_cols = start_cols
-        # (M, L) column index of every stored element; shared by to_dense and matmul.
-        self._col_idx = start_cols[:, None] + torch.arange(L, device=values.device)
-        # Transpose structure for the deterministic triton grad_B kernel;
-        # built lazily on the first product that needs grad wrt B.
-        self._t_cache = None
+        self._col_idx = start_cols[:, None] + torch.arange(
+            num_taps, device=values.device
+        )
+        # Build lazily when a product first needs the dense operand's gradient.
+        self._transpose_cache: tuple[Tensor, Tensor, Tensor] | None = None
 
     def _column_index(self) -> Tensor:
-        # `values` may have been swapped to another device in place (e.g. by
-        # Module._apply); keep the cached index (and start_cols) where the
-        # compute runs.
+        # Values may move in place through Module._apply; move cached indices too.
         if self._col_idx.device != self.values.device:
             self._col_idx = self._col_idx.to(self.values.device)
             self.start_cols = self.start_cols.to(self.values.device)
@@ -491,51 +539,72 @@ class RCSMatrix(torch.Tensor):
 
     def to_dense(self) -> Tensor:
         """Materialize the represented ``M x N`` matrix as a dense tensor."""
-        M, N = self.shape
-        return self.values.new_zeros(M, N).scatter_(1, self._column_index(), self.values)
+        num_rows, num_cols = self.shape
+        return self.values.new_zeros(num_rows, num_cols).scatter_(
+            1, self._column_index(), self.values
+        )
 
     def _matmul_dense(self, other: Tensor) -> Tensor:
         """Compute ``self @ other`` using the compact representation."""
-        if other.ndim == 1:  # matrix-vector product, as torch.matmul defines it
+        if other.ndim == 1:
             return self._matmul_dense(other.unsqueeze(1)).squeeze(1)
-        M, N = self.shape
-        if other.ndim != 2 or other.shape[0] != N:
+        num_rows, num_cols = self.shape
+        if other.ndim != 2 or other.shape[0] != num_cols:
             raise ValueError(
-                f"expected other of shape ({N}, K) or ({N},), got {tuple(other.shape)}"
+                f"expected other of shape ({num_cols}, K) or ({num_cols},), got {tuple(other.shape)}"
             )
-        L = self.values.shape[1]
+        if self.values.device != other.device:
+            raise ValueError(
+                "RCS values and the dense operand must be on the same device"
+            )
+        num_taps = self.values.shape[1]
         if (
             rcs_mm is not None
-            and L > 0
+            and num_taps > 0
             and self.values.is_cuda
             and other.is_cuda
             and self.values.dtype == other.dtype
+            and self.values.dtype
+            in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
         ):
-            # Fastest path on GPU: fused Triton kernels, differentiable
-            # (including double backward via its grad-mode backward branch).
             self._column_index()  # syncs start_cols to the compute device
             if torch.is_grad_enabled() and other.requires_grad:
                 if (
-                    self._t_cache is None
-                    or self._t_cache[0].device != self.values.device
+                    self._transpose_cache is None
+                    or self._transpose_cache[0].device != self.values.device
                 ):
-                    self._t_cache = _build_transpose_cache(self.start_cols, L, N)
-            return rcs_mm(self.values, self.start_cols, other, self._t_cache)
+                    self._transpose_cache = _build_transpose_cache(
+                        self.start_cols, num_taps, num_cols
+                    )
+            return rcs_mm(self.values, self.start_cols, other, self._transpose_cache)
         grad_needed = torch.is_grad_enabled() and (
             self.values.requires_grad or other.requires_grad
         )
-        if L > 0 and not grad_needed:
-            # Inference: cuSPARSE/MKL CSR spmm avoids materializing the
-            # (M, L, K) windows. Not used under autograd — CSR matmul is not
-            # twice-differentiable and its grad semantics differ from dense.
-            idx = self._column_index()
-            crow = torch.arange(0, M * L + 1, L, device=idx.device)
+        # CPU CSR kernels lack half/bfloat16 support, including under autocast.
+        cpu_csr_supported = (
+            self.values.dtype
+            in (torch.float32, torch.float64, torch.complex64, torch.complex128)
+            and not _cpu_autocast_enabled()
+        )
+        if (
+            num_taps > 0
+            and not grad_needed
+            and (self.values.is_cuda or cpu_csr_supported)
+        ):
+            # CSR avoids gathered windows, but lacks the higher-order gradients
+            # needed by the autograd path.
+            column_indices = self._column_index()
+            row_offsets = torch.arange(
+                0, num_rows * num_taps + 1, num_taps, device=column_indices.device
+            )
             csr = torch.sparse_csr_tensor(
-                crow, idx.reshape(-1), self.values.reshape(-1), size=(M, N)
+                row_offsets,
+                column_indices.reshape(-1),
+                self.values.reshape(-1),
+                size=(num_rows, num_cols),
             )
             return csr @ other
-        # Row i of the product only needs rows J_i .. J_i + L - 1 of `other`:
-        # gather them into (M, L, K) windows and contract with values (M, L).
+        # Each output row needs only L rows of the dense operand.
         windows = other[self._column_index()]
         return torch.bmm(self.values.unsqueeze(1), windows).squeeze(1)
 
@@ -544,21 +613,21 @@ class RCSMatrix(torch.Tensor):
         if kwargs is None:
             kwargs = {}
         if func in _MATMUL_FUNCS:
-            kw = dict(kwargs)
-            out = kw.pop("out", None)
+            remaining_kwargs = dict(kwargs)
+            out = remaining_kwargs.pop("out", None)
             operands = list(args)
-            if not operands and "input" in kw:
-                operands.append(kw.pop("input"))
-            if len(operands) == 1 and "other" in kw:
-                operands.append(kw.pop("other"))
-            if len(operands) == 2 and not kw and out is None:
-                a, b = operands
+            if not operands and "input" in remaining_kwargs:
+                operands.append(remaining_kwargs.pop("input"))
+            if len(operands) == 1 and "other" in remaining_kwargs:
+                operands.append(remaining_kwargs.pop("other"))
+            if len(operands) == 2 and not remaining_kwargs and out is None:
+                matrix, other = operands
                 if (
-                    isinstance(a, RCSMatrix)
-                    and isinstance(b, Tensor)
-                    and not isinstance(b, RCSMatrix)
+                    isinstance(matrix, RCSMatrix)
+                    and isinstance(other, Tensor)
+                    and not isinstance(other, RCSMatrix)
                 ):
-                    return a._matmul_dense(b)
+                    return matrix._matmul_dense(other)
         # Metadata accessors (shape, dtype, device, ...) work on the
         # storage-less wrapper; data ops fall through to __torch_dispatch__.
         with torch._C.DisableTorchFunctionSubclass():
@@ -571,7 +640,7 @@ class RCSMatrix(torch.Tensor):
             "convert with .to_dense() first"
         )
 
-    def __deepcopy__(self, memo: dict) -> "RCSMatrix":
+    def __deepcopy__(self, memo: dict[int, Any]) -> "RCSMatrix":
         result = RCSMatrix(
             copy.deepcopy(self.values, memo),
             copy.deepcopy(self.start_cols, memo),
@@ -581,9 +650,9 @@ class RCSMatrix(torch.Tensor):
         return result
 
     def __repr__(self) -> str:
-        M, N = self.shape
+        num_rows, num_cols = self.shape
         return (
-            f"RCSMatrix(shape=({M}, {N}), L={self.values.shape[1]}, "
+            f"RCSMatrix(shape=({num_rows}, {num_cols}), L={self.values.shape[1]}, "
             f"dtype={self.dtype}, device={self.device},\n"
             f"values={self.values},\nstart_cols={self.start_cols})"
         )
