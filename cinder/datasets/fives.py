@@ -1,25 +1,28 @@
-"""FIVES — Fundus Image VEssel Segmentation dataset.
+"""FIVES fundus image vessel segmentation dataset.
 
-Directory structure expected::
+Expected layout::
 
     root/
     ├── train/
     │   ├── Original/       # RGB fundus images (*.png)
-    │   └── Ground truth/   # Binary vessel masks (*.png)
+    │   └── Ground truth/   # binary vessel masks (*.png), same file names
     └── test/
         ├── Original/
         └── Ground truth/
 """
 
+import os
 from pathlib import Path
 
 from .utils import glob_datalist
 
-
-def _target_fn(img_path: str) -> str:
-    return img_path.replace("/Original/", "/Ground truth/")
+__all__ = ["create_datalist"]
 
 
-def create_datalist(root: str | Path, split: str = "train") -> list[dict]:
-    """Return a datalist for the given *split* (``"train"`` or ``"test"``)."""
-    return glob_datalist(root, f"{split}/Original/*.png", _target_fn)
+def create_datalist(root: str | Path, split: str = "train") -> list[dict[str, str]]:
+    """List image and mask pairs for the ``"train"`` or ``"test"`` split."""
+
+    def target_path(image_path: str) -> str:
+        return os.path.join(root, split, "Ground truth", os.path.basename(image_path))
+
+    return glob_datalist(root, f"{split}/Original/*.png", target_path)
