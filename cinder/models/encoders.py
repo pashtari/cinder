@@ -1,278 +1,209 @@
+"""Image encoders that produce spatial features for CINDER."""
+
+from collections.abc import Mapping, Sequence
+from itertools import chain
+from typing import Any
+
 import timm
 import torch
+from timm.layers import Format
 from torch import Tensor, nn
+
+__all__ = ["BaseEncoder", "ChannelNorm", "TimmEncoder"]
 
 
 class BaseEncoder(nn.Module):
-    """Base class for image feature encoders.
+    """Base class for image encoders that return spatial feature maps.
 
-    An encoder maps an image ``(B, in_channels, H, W)`` to a spatial feature map
-    ``(B, embed_dim, H', W')``. Subclasses implement :meth:`forward`; the shared
-    :meth:`get_output_size` reports the feature-map size produced for a given
-    input resolution.
+    Subclasses implement :meth:`forward`, which returns a tuple of maps shaped
+    ``(B, embed_dims[i], H_i, W_i)`` even for a single stage, and may set
+    :attr:`embed_dims`. CINDER sizes its modulator from :meth:`get_output_shapes`.
 
     Args:
         in_channels: Number of input image channels.
+
+    Attributes:
+        embed_dims: Channel count of each returned feature map.
     """
+
+    embed_dims: tuple[int, ...]
 
     def __init__(self, in_channels: int) -> None:
         super().__init__()
         self.in_channels = in_channels
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Map ``(B, in_channels, H, W)`` -> ``(B, embed_dim, H', W')``."""
+    def forward(self, x: Tensor) -> tuple[Tensor, ...]:
+        """Map an image batch to a tuple of ``(B, C_i, H_i, W_i)`` features."""
         raise NotImplementedError
 
     @torch.no_grad()
-    def get_output_size(self, in_size: tuple[int, int]) -> tuple[int, ...]:
-        """Return the per-sample output size ``(embed_dim, H', W')`` for an ``in_size`` input.
+    def get_output_shapes(
+        self, in_size: tuple[int, int]
+    ) -> tuple[tuple[int, ...], ...]:
+        """Return the ``(C_i, H_i, W_i)`` map shapes for an ``(H, W)`` input.
 
-        Runs a dry forward pass in eval mode -- so it neither tracks gradients
-        nor perturbs normalization running statistics -- on a zero image matching
-        the encoder's device and ``in_channels``.
+        The shapes come from a dry run on the encoder's device and dtype. It
+        runs in eval mode so running statistics are untouched, and restores
+        every submodule's training mode afterward.
         """
-        was_training = self.training
+        training_modes = {module: module.training for module in self.modules()}
         self.eval()
         try:
-            param = next(self.parameters(), None)
-            device = param.device if param is not None else torch.device("cpu")
-            dummy = torch.zeros(1, self.in_channels, *in_size, device=device)
-            out_size = tuple(int(s) for s in self(dummy).shape[1:])
+            reference = next(chain(self.parameters(), self.buffers()), torch.empty(0))
+            dummy = torch.zeros(
+                1,
+                self.in_channels,
+                *in_size,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+            return tuple(
+                tuple(int(size) for size in features.shape[1:])
+                for features in self(dummy)
+            )
         finally:
-            self.train(was_training)
-        return out_size
+            for module, training in training_modes.items():
+                module.training = training
 
 
 class ChannelNorm(nn.Module):
-    """Learnable per-channel normalization layer.
+    """Learnable per-channel affine map initialized to ``(x - mean) / std``.
 
-    Initialized to ImageNet standard normalization:
-        ``(x - mean) / std``
-    with ``mean = [0.485, 0.456, 0.406]`` and ``std = [0.229, 0.224, 0.225]``.
+    Defaults to ImageNet statistics; :class:`TimmEncoder` passes the backbone's
+    pretrained statistics. Statistics repeat cyclically for extra channels.
     """
 
-    MEAN = [0.485, 0.456, 0.406]
-    STD = [0.229, 0.224, 0.225]
+    MEAN = (0.485, 0.456, 0.406)
+    STD = (0.229, 0.224, 0.225)
 
-    def __init__(self, num_channels: int = 3):
+    def __init__(
+        self,
+        num_channels: int = 3,
+        mean: Sequence[float] | None = None,
+        std: Sequence[float] | None = None,
+    ) -> None:
         super().__init__()
-        # Cycle the ImageNet stats so any channel count is supported (identical
-        # to slicing for the usual num_channels <= 3).
-        mean = [self.MEAN[i % len(self.MEAN)] for i in range(num_channels)]
-        std = [self.STD[i % len(self.STD)] for i in range(num_channels)]
-        alpha_init = torch.tensor([1.0 / s for s in std]).reshape(1, num_channels, 1, 1)
-        beta_init = torch.tensor([-m / s for m, s in zip(mean, std)]).reshape(
-            1, num_channels, 1, 1
-        )
-        self.alpha = nn.Parameter(alpha_init)
-        self.beta = nn.Parameter(beta_init)
+        mean = self.MEAN if mean is None else mean
+        std = self.STD if std is None else std
+        mean = [mean[i % len(mean)] for i in range(num_channels)]
+        std = [std[i % len(std)] for i in range(num_channels)]
+        scale = torch.tensor([1.0 / s for s in std]).view(1, num_channels, 1, 1)
+        offset = torch.tensor([-m / s for m, s in zip(mean, std)])
+        offset = offset.view(1, num_channels, 1, 1)
+        self.alpha = nn.Parameter(scale)
+        self.beta = nn.Parameter(offset)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor) -> Tensor:
+        """Normalize an image batch shaped ``(B, C, H, W)``."""
         return self.alpha * x + self.beta
 
 
 class TimmEncoder(BaseEncoder):
-    """Feature encoder wrapping any pretrained ``timm`` model.
+    """Feature maps of a timm CNN or transformer as ``(B, C_i, H_i, W_i)`` tensors.
+
+    Maps are returned in stage order at their native resolution and described by
+    ``out_indices``, ``embed_dims`` and ``feature_reductions``. Channels-last
+    backbones (e.g. Swin) are converted to channels-first.
 
     Args:
-        model_name: Name of a timm model.
-        pretrained: Whether to load pretrained weights.
-        normalize: Whether to apply learnable LayerNorm to output features.
-        out_index: If set, use ``features_only`` mode and return the feature
-            map at this stage index (0 = shallowest / least downsampling).
-            When ``None``, use the model's ``forward_features`` (final stage).
-        **model_kwargs: Extra keyword arguments forwarded to
-            ``timm.create_model`` (e.g. ``patch_size``, ``img_size``).
+        model_name: Backbone with timm ``features_only`` support.
+        pretrained: Load pretrained backbone weights.
+        normalize: Apply a learnable channel LayerNorm to each output map.
+            Input normalization always starts from the backbone's mean/std.
+        in_channels: Number of image channels.
+        **model_kwargs: Passed to timm, including ``out_indices`` (default:
+            deepest level) and ``img_size`` for fixed-size transformers.
     """
+
+    output_fmt = Format.NCHW
 
     def __init__(
         self,
         model_name: str = "tf_efficientnetv2_s.in21k_ft_in1k",
         pretrained: bool = True,
         normalize: bool = True,
-        out_index: int | None = None,
         in_channels: int = 3,
-        **model_kwargs,
-    ):
+        **model_kwargs: Any,
+    ) -> None:
         super().__init__(in_channels)
         self.model_name = model_name
         self.normalize = normalize
-        self.out_index = out_index
-
-        # Learnable per-channel normalization
-        self.channel_norm = ChannelNorm(num_channels=in_channels)
-
-        if out_index is not None:
-            # Extract intermediate features at a specific stage
-            self.encoder = timm.create_model(
-                model_name,
-                pretrained=pretrained,
-                features_only=True,
-                out_indices=[out_index],
-                in_chans=in_channels,
-                **model_kwargs,
+        if model_kwargs.get("patch_drop_rate", 0):
+            raise ValueError(
+                "patch_drop_rate must be 0 to preserve dense spatial grids"
             )
-            # feature_info gives channel dims per stage
-            self._embed_dim = self.encoder.feature_info.channels()[0]
-        else:
-            # Use full model without classification head
-            self.encoder = timm.create_model(
-                model_name,
-                pretrained=pretrained,
-                num_classes=0,
-                in_chans=in_channels,
-                **model_kwargs,
-            )
-            self._embed_dim = self.encoder.num_features
 
-        # Learnable feature normalization
+        model_kwargs.setdefault("out_indices", (-1,))
+        backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            features_only=True,
+            in_chans=in_channels,
+            **model_kwargs,
+        )
+        config = getattr(backbone, "pretrained_cfg", {})
+        # Registered before the backbone, which fixes the optimizer state order.
+        self.channel_norm = ChannelNorm(
+            in_channels, mean=config.get("mean"), std=config.get("std")
+        )
+        self.backbone = backbone
+
+        # timm emits stages in execution order but keeps its metadata in request
+        # order, so resolve and sort the indices.
+        info = backbone.feature_info
+        num_stages = len(info)
+        if not info.out_indices or any(
+            not -num_stages <= index < num_stages for index in info.out_indices
+        ):
+            raise ValueError(
+                f"out_indices must select levels in [-{num_stages}, {num_stages - 1}]"
+            )
+        self.out_indices = tuple(
+            sorted({index % num_stages for index in info.out_indices})
+        )
+        self.embed_dims = tuple(info.channels(self.out_indices))
+        self.feature_reductions = tuple(info.reduction(self.out_indices))
+
+        native_format = getattr(backbone, "output_fmt", None) or Format.NCHW
+        if native_format not in (Format.NCHW, Format.NHWC):
+            raise ValueError(
+                f"unsupported feature format {native_format!r}; expected NCHW or NHWC"
+            )
+        self.channels_last = native_format == Format.NHWC
         if normalize:
-            self.layer_norm = nn.LayerNorm(self._embed_dim)
-
-    @property
-    def embed_dim(self) -> int:
-        """Return the embedding dimension of the model."""
-        return self._embed_dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract a spatial feature map from input images.
-
-        Args:
-            x: Input tensor of shape ``(B, in_channels, H, W)``.
-
-        Returns:
-            Feature map of shape ``(B, embed_dim, H', W')``.
-        """
-        # Apply learnable channel normalization
-        x = self.channel_norm(x)
-
-        if self.out_index is not None:
-            # features_only mode returns a list of feature maps
-            features = self.encoder(x)[0]  # (B, C, H', W')
-        else:
-            # forward_features returns a spatial map (CNN) or tokens (ViT)
-            features = self.encoder.forward_features(x)
-
-        # Canonicalize ViT token sequences (B, N, C) into a spatial grid.
-        if features.ndim == 3:
-            prefix = getattr(self.encoder, "num_prefix_tokens", 0)
-            if prefix:  # drop CLS / distillation tokens
-                features = features[:, prefix:]
-            b, n, c = features.shape
-            grid = getattr(getattr(self.encoder, "patch_embed", None), "grid_size", None)
-            h, w = grid if grid is not None else (int(n**0.5), int(n**0.5))
-            if h * w != n:
-                raise RuntimeError(
-                    f"cannot reshape {n} tokens into a spatial grid: the encoder "
-                    f"exposes no `patch_embed.grid_size` and {n} is not square."
-                )
-            features = features.transpose(1, 2).reshape(b, c, h, w)
-
-        # Optionally normalize over the channel dim at each spatial location.
-        if self.normalize:
-            features = self.layer_norm(features.movedim(1, -1)).movedim(-1, 1)
-
-        return features  # (B, embed_dim, H', W')
-
-
-class DoubleConv(nn.Module):
-    """(Conv -- Norm -- Act) ** 2."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        mid_channels: int = None,
-        kernel_size: int = 3,
-        stride: int = 1,
-        **kwargs,
-    ):
-        super().__init__()
-        mid_channels = out_channels if mid_channels is None else mid_channels
-        padding = (kernel_size - 1) // 2
-
-        self.block1 = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                mid_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-            ),
-            nn.InstanceNorm2d(mid_channels),
-            nn.LeakyReLU(inplace=True),
-        )
-
-        self.block2 = nn.Sequential(
-            nn.Conv2d(
-                mid_channels,
-                out_channels,
-                kernel_size=kernel_size,
-                stride=1,
-                padding=padding,
-            ),
-            nn.GroupNorm(num_groups=8, num_channels=out_channels),
-            nn.LeakyReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        out = self.block1(x)
-        out = self.block2(out)
-        return out
-
-
-class UNetEncoderBlock(nn.Module):
-    """U-Net block for one stage."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        stride: int = 1,
-        depth: int = 1,
-    ):
-        super().__init__()
-        self.blocks = nn.Sequential(
-            DoubleConv(in_channels, out_channels, kernel_size=kernel_size, stride=stride)
-        )
-
-        for _ in range(1, depth):
-            self.blocks.append(DoubleConv(out_channels, out_channels, stride=1))
-
-    def forward(self, x):
-        out = self.blocks(x)
-        return out
-
-
-class UNetEncoder(BaseEncoder):
-    """U-Net feature encoder."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: tuple[int, ...] = (32, 64, 128, 256, 512),
-        depth: tuple[int, ...] = (1, 1, 1, 1, 1),
-        strides: tuple[int, ...] = (1, 2, 2, 2, 2),
-        kernel_size: int = 3,
-    ):
-        super().__init__(in_channels)
-        channels = [in_channels, *out_channels]
-        self.blocks = nn.ModuleList()
-        for i in range(len(out_channels)):
-            self.blocks.append(
-                UNetEncoderBlock(
-                    channels[i],
-                    channels[i + 1],
-                    kernel_size=kernel_size,
-                    stride=strides[i],
-                    depth=depth[i],
-                )
+            self.layer_norms = nn.ModuleList(
+                nn.LayerNorm(channels) for channels in self.embed_dims
             )
 
-    def forward(self, x):
-        out = x
-        for blk in self.blocks:
-            out = blk(out)
+    def forward(self, x: Tensor) -> tuple[Tensor, ...]:
+        if x.ndim != 4 or x.shape[1] != self.in_channels:
+            raise ValueError(f"input must have shape (B, {self.in_channels}, H, W)")
+        features = self.backbone(self.channel_norm(x))
+        if isinstance(features, Mapping):
+            features = tuple(features.values())
+        if not isinstance(features, (list, tuple)):
+            raise TypeError("expected a sequence of spatial feature maps")
+        if len(features) != len(self.embed_dims):
+            raise RuntimeError(
+                f"expected {len(self.embed_dims)} feature maps, got {len(features)}"
+            )
+        return tuple(
+            self._prepare_feature(feature, i, x.shape[0])
+            for i, feature in enumerate(features)
+        )
 
-        return out  # (B, embed_dim, H', W')
+    def _prepare_feature(self, feature: Tensor, index: int, batch_size: int) -> Tensor:
+        """Check a map, move it to NCHW and optionally normalize its channels."""
+        if not isinstance(feature, Tensor) or feature.ndim != 4:
+            raise ValueError(f"feature {index} must be a 4D spatial map")
+        if self.channels_last:
+            feature = feature.movedim(-1, 1)
+        channels = self.embed_dims[index]
+        if feature.shape[:2] != (batch_size, channels):
+            raise ValueError(
+                f"feature {index} must have batch size {batch_size} and {channels} "
+                f"channels, got shape {tuple(feature.shape)}"
+            )
+        if self.normalize:
+            feature = self.layer_norms[index](feature.movedim(1, -1)).movedim(-1, 1)
+        return feature

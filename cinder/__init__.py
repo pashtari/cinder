@@ -1,9 +1,6 @@
-"""CINDER: Conditioned Implicit Neural DecodeR for Medical Image Segmentation."""
+"""CINDER: Conditioned Implicit Neural DecodeR for dense prediction."""
 
-__version__ = "0.1.0"
-
-from .datasets import glob_datalist, SegmentationDataset
-from .models import BaseEncoder, TimmEncoder, UNetEncoder, ConditionalFUTON, CINDER
+from .datasets import SegmentationDataset, glob_datalist
 from .engine import (
     create_trainer,
     create_evaluator,
@@ -18,3 +15,52 @@ from .engine import (
     ObjectDice,
     ObjectHausdorff,
 )
+from .models import (
+    CINDER,
+    FINER,
+    FUTON,
+    MLP,
+    RFF,
+    SIREN,
+    WIRE,
+    BaseEncoder,
+    BaseModulator,
+    FUTONGate,
+    Gauss,
+    ListModulators,
+    TimmEncoder,
+    WeightDisplacement,
+)
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "SegmentationDataset",
+    "glob_datalist",
+    "CINDER",
+    "FINER",
+    "FUTON",
+    "MLP",
+    "RFF",
+    "SIREN",
+    "WIRE",
+    "BaseEncoder",
+    "BaseModulator",
+    "FUTONGate",
+    "Gauss",
+    "ListModulators",
+    "TimmEncoder",
+    "WeightDisplacement",
+    "create_trainer",
+    "create_evaluator",
+    "make_sampled_target_fn",
+    "SampledLoss",
+    "DiceLoss",
+    "DiceCELoss",
+    "DiceMetric",
+    "IoUMetric",
+    "HausdorffDistanceMetric",
+    "DetectionF1",
+    "ObjectDice",
+    "ObjectHausdorff",
+]
