@@ -1,112 +1,137 @@
+"""TensorBoard curves and segmentation previews for training runs."""
+
+from pathlib import Path
+from typing import Any
+
 import ignite.distributed as idist
 import torch
-from ignite.engine import Events
-from ignite.handlers import global_step_from_engine
+from ignite.engine import Engine, Events
+from ignite.handlers import TensorboardLogger, global_step_from_engine
+from torch import Tensor
 
-try:  # ignite >= 0.5
-    from ignite.handlers.tensorboard_logger import TensorboardLogger
-except ModuleNotFoundError:  # ignite < 0.5
-    from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger
+__all__ = ["setup_tensorboard_logging"]
 
-# Qualitative palette (RGB in [0, 1]); index 0 is background (black), 1 is white.
-# Used to colorize multi-class label maps; binary masks use index 0/1 only.
+# Class colors for multi-class previews; classes past the end share the last color.
+# Binary masks are drawn in grayscale.
 _PALETTE = torch.tensor(
     [
-        [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.90, 0.10, 0.10], [0.10, 0.60, 0.10],
-        [0.10, 0.30, 0.90], [0.90, 0.80, 0.10], [0.80, 0.10, 0.80], [0.10, 0.80, 0.80],
-        [0.90, 0.50, 0.10], [0.50, 0.20, 0.70], [0.40, 0.40, 0.40], [0.60, 0.90, 0.30],
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [0.90, 0.10, 0.10],
+        [0.10, 0.60, 0.10],
+        [0.10, 0.30, 0.90],
+        [0.90, 0.80, 0.10],
+        [0.80, 0.10, 0.80],
+        [0.10, 0.80, 0.80],
+        [0.90, 0.50, 0.10],
+        [0.50, 0.20, 0.70],
+        [0.40, 0.40, 0.40],
+        [0.60, 0.90, 0.30],
     ]
 )
 
 
-def _pred_to_label(pred: torch.Tensor) -> torch.Tensor:
-    """``(C, H, W)`` logits -> ``(H, W)`` integer label map."""
-    if pred.shape[0] == 1:  # binary: sigmoid + threshold
-        return (pred[0].sigmoid() > 0.5).long()
-    return pred.argmax(dim=0)  # multi-class: argmax
+def _prediction_labels(prediction: Tensor) -> Tensor:
+    """Convert ``(C, H, W)`` logits to ``(H, W)`` integer labels."""
+    if prediction.shape[0] == 1:
+        return (prediction[0].sigmoid() > 0.5).long()
+    return prediction.argmax(dim=0)
 
 
-def _target_to_label(target: torch.Tensor) -> torch.Tensor:
-    """``(1, H, W)`` binary mask or ``(H, W)`` class indices -> ``(H, W)`` labels."""
+def _target_labels(target: Tensor) -> Tensor:
+    """Convert binary masks or class indices to ``(H, W)`` integer labels."""
     if target.ndim == 3:
         return (target[0] > 0.5).long()
     return target.long()
 
 
-def _colorize(label: torch.Tensor, num_classes: int) -> torch.Tensor:
-    """``(H, W)`` integer labels -> ``(3, H, W)`` RGB in [0, 1]."""
-    if num_classes <= 1:  # binary -> white foreground on black
-        m = label.float().clamp(0.0, 1.0)
-        return m.unsqueeze(0).expand(3, *m.shape)
-    palette = _PALETTE.to(label.device)
-    idx = label.clamp(0, palette.shape[0] - 1)
-    return palette[idx].permute(2, 0, 1)
+def _colorize(labels: Tensor, num_classes: int) -> Tensor:
+    """Map ``(H, W)`` integer labels to ``(3, H, W)`` RGB in [0, 1]."""
+    if num_classes <= 1:
+        mask = labels.float().clamp(0.0, 1.0)
+        return mask.unsqueeze(0).expand(3, *mask.shape)
+    palette = _PALETTE.to(labels.device)
+    indices = labels.clamp(0, palette.shape[0] - 1)
+    return palette[indices].permute(2, 0, 1)
 
 
-def _panel(
-    inp: torch.Tensor,
-    tgt: torch.Tensor,
-    prd: torch.Tensor,
+def _make_panel(
+    image: Tensor,
+    target: Tensor,
+    prediction: Tensor,
     num_classes: int,
-    sep: int = 4,
-) -> torch.Tensor:
-    """Build an ``input | ground-truth | prediction`` RGB panel, ``(3, H, 3W + 2sep)``."""
-    inp = inp.float().clamp(0.0, 1.0)
-    if inp.shape[0] == 1:
-        inp = inp.expand(3, *inp.shape[1:])
-    gt = _colorize(_target_to_label(tgt), num_classes)
-    pr = _colorize(_pred_to_label(prd), num_classes)
-    bar = torch.ones(3, inp.shape[1], sep)
-    return torch.cat([inp, bar, gt, bar, pr], dim=2)
+    separator_width: int = 4,
+) -> Tensor:
+    """Build an RGB panel showing the input, target, and prediction."""
+    image = image.float().clamp(0.0, 1.0)
+    if image.shape[0] == 1:
+        image = image.expand(3, *image.shape[1:])
+    target_rgb = _colorize(_target_labels(target), num_classes)
+    prediction_rgb = _colorize(_prediction_labels(prediction), num_classes)
+    separator = torch.ones(3, image.shape[1], separator_width)
+    return torch.cat([image, separator, target_rgb, separator, prediction_rgb], dim=2)
 
 
-def _attach_image_logging(tb_logger, trainer, evaluator, num_examples: int) -> None:
-    """Log ``input | GT | prediction`` panels for the first ``num_examples``
-    validation cases to TensorBoard after every evaluation (rank 0 only).
-
-    Captures the (fixed, since the val loader is unshuffled) first few cases of
-    each evaluation run and writes them under per-example tags stepped by the
-    training iteration, so the TensorBoard image slider shows each case evolving
-    on the same axis as the scalar curves.
-    """
-    buffer: list[torch.Tensor] = []
+def _attach_image_logging(
+    tb_logger: TensorboardLogger, trainer: Engine, evaluator: Engine, num_examples: int
+) -> None:
+    """Log the first validation cases against the training iteration."""
+    panels: list[Tensor] = []
 
     @evaluator.on(Events.EPOCH_STARTED)
-    def _reset(_engine) -> None:
-        buffer.clear()
+    def _reset(_engine: Engine) -> None:
+        panels.clear()
 
     @evaluator.on(Events.ITERATION_COMPLETED)
-    def _capture(engine) -> None:
-        if len(buffer) >= num_examples:
+    def _capture(engine: Engine) -> None:
+        if len(panels) >= num_examples:
             return
-        inputs, targets = engine.state.batch  # raw (CPU) batch
-        preds = engine.state.output[0]  # logits (on device)
-        num_classes = preds.shape[1]
-        take = min(num_examples - len(buffer), inputs.shape[0])
-        for b in range(take):
-            buffer.append(
-                _panel(inputs[b], targets[b], preds[b].detach().cpu(), num_classes)
+        inputs, targets = engine.state.batch
+        predictions = engine.state.output[0]
+        num_classes = predictions.shape[1]
+        remaining = min(num_examples - len(panels), inputs.shape[0])
+        for index in range(remaining):
+            panels.append(
+                _make_panel(
+                    inputs[index],
+                    targets[index],
+                    predictions[index].detach().cpu(),
+                    num_classes,
+                )
             )
 
     @evaluator.on(Events.EPOCH_COMPLETED)
-    def _write(_engine) -> None:
+    def _write(_engine: Engine) -> None:
         step = trainer.state.iteration
-        for i, panel in enumerate(buffer):
-            tb_logger.writer.add_image(f"val/example_{i}", panel, global_step=step)
+        for index, panel in enumerate(panels):
+            tb_logger.writer.add_image(f"val/example_{index}", panel, global_step=step)
 
 
-def tensorboard(
-    objects,
-    output_path="./",
-    log_images=True,
-    num_examples=2,
-    log_interval=50,
-    **kwargs,
-):
-    rank = idist.get_rank()
+def setup_tensorboard_logging(
+    objects: dict[str, Any],
+    log_dir: str | Path = "./",
+    num_examples: int = 2,
+    log_interval: int = 50,
+    **kwargs: Any,
+) -> None:
+    """Log the training loss, learning rate, metrics and validation previews.
 
-    if rank != 0:
-        return None
+    Every curve is stepped by training iteration. The loss and learning rate are
+    single-iteration values, sampled every ``log_interval`` iterations. The
+    logger closes when training completes.
+
+    Args:
+        objects: Run objects from the training entry point: ``trainer``,
+            ``optimizer``, ``train_evaluator`` and ``val_evaluator``.
+        log_dir: TensorBoard log directory.
+        num_examples: Validation cases logged as ``input | target | prediction``
+            panels after each evaluation; ``0`` disables them. The validation
+            loader is not shuffled, so the same cases appear every time.
+        log_interval: Iterations between loss and learning-rate points.
+        **kwargs: Passed to :class:`~ignite.handlers.TensorboardLogger`.
+    """
+    if idist.get_rank() != 0:
+        return
 
     trainer = objects["trainer"]
     optimizer = objects["optimizer"]
@@ -115,12 +140,7 @@ def tensorboard(
         "val": objects["val_evaluator"],
     }
 
-    # Attached by hand rather than through ignite's common.setup_tb_logging,
-    # which steps evaluator metrics by the trainer's *epoch*. An epoch here is
-    # one evaluation interval, so validation curves would be plotted against
-    # 1, 2, 3... Everything below is on the iteration axis instead, which is
-    # also the unit the training budget is expressed in.
-    tb_logger = TensorboardLogger(log_dir=output_path, **kwargs)
+    tb_logger = TensorboardLogger(log_dir=log_dir, **kwargs)
 
     tb_logger.attach_output_handler(
         trainer,
@@ -144,11 +164,9 @@ def tensorboard(
             ),
         )
 
-    # Log a few qualitative val examples (input / ground truth / prediction)
-    # after each evaluation.
-    if log_images and num_examples > 0 and "val_evaluator" in objects:
+    if num_examples > 0:
         _attach_image_logging(
-            tb_logger, trainer, objects["val_evaluator"], int(num_examples)
+            tb_logger, trainer, objects["val_evaluator"], num_examples
         )
 
-    return tb_logger
+    trainer.add_event_handler(Events.COMPLETED, lambda _: tb_logger.close())

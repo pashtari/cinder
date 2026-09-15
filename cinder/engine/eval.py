@@ -1,28 +1,29 @@
-"""Evaluation entry point — run with ``python -m cinder.engine.eval`` from project root."""
+"""Evaluate CINDER with ``scripts/eval.sh`` or ``python -m cinder.engine.eval``."""
 
 import os
 
 import hydra
-from omegaconf import DictConfig
-from ignite.utils import manual_seed
 import ignite.distributed as idist
+from ignite.utils import manual_seed
+from omegaconf import DictConfig
 
-from .engine import create_evaluator
+from ..handlers.progress import quiet_library_loggers
+from .engines import create_evaluator
 
 
-def evaluate(local_rank, cfg) -> None:
+def evaluate(local_rank: int, cfg: DictConfig) -> None:
+    """Evaluate on one process; ``idist.Parallel`` supplies ``local_rank``."""
+    quiet_library_loggers()
     device = idist.device()
-    rank = idist.get_rank()
-    manual_seed(cfg.seed + rank)
+    manual_seed(cfg.seed + idist.get_rank())
 
-    model = hydra.utils.instantiate(cfg.model)
-    model = idist.auto_model(model)
-
+    model = idist.auto_model(hydra.utils.instantiate(cfg.model))
     val_loader = hydra.utils.instantiate(cfg.dataset.val_loader)
-    metrics = {k: hydra.utils.instantiate(v) for k, v in cfg.metric.items()}
-
+    metrics = {name: hydra.utils.instantiate(spec) for name, spec in cfg.metric.items()}
     inferer = hydra.utils.instantiate(cfg.inferer)
-    evaluator = create_evaluator(model, metrics, device, inferer=inferer)
+    evaluator = create_evaluator(
+        model, metrics, device, non_blocking=cfg.trainer.non_blocking, inferer=inferer
+    )
 
     objects = {
         "evaluator": evaluator,
@@ -31,14 +32,16 @@ def evaluate(local_rank, cfg) -> None:
         "seed": cfg.seed,
         "output_dir": cfg.path.output_dir,
     }
-    for value in cfg.handler.values():
-        hydra.utils.instantiate(value)(objects=objects)
+    # The checkpoint handler restores the model weights here.
+    for handler in cfg.handler.values():
+        hydra.utils.instantiate(handler)(objects=objects)
 
     evaluator.run(val_loader)
 
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="eval")
 def main(cfg: DictConfig) -> None:
+    """Launch evaluation, distributed across processes when started by torchrun."""
     backend = "nccl" if "RANK" in os.environ else None
     with idist.Parallel(backend=backend) as parallel:
         parallel.run(evaluate, cfg)

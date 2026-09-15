@@ -1,20 +1,41 @@
+"""Training and evaluation engines, segmentation losses, metrics and inferers."""
+
 from omegaconf import OmegaConf
 
-from .engine import create_trainer, create_evaluator
-from .losses import make_sampled_target_fn, SampledLoss, DiceLoss, DiceCELoss
+from .engines import create_evaluator, create_trainer
+from .inferers import MultiScaleFlipInferer, SlidingWindowInferer
+from .losses import DiceCELoss, DiceLoss, MaskedCrossEntropyLoss, SampledLoss
 from .metrics import (
     DiceMetric,
-    IoUMetric,
     HausdorffDistanceMetric,
-    DetectionF1,
-    ObjectDice,
-    ObjectHausdorff,
+    IoUMetric,
+    ObjectDiceMetric,
+    ObjectF1Metric,
+    ObjectHausdorffMetric,
 )
 
-# ``${frac:<value>,<fraction>}`` -> round(value * fraction), as an int. Lets a
-# config express a schedule length as a share of the training budget rather than
-# a literal that silently stops matching when the budget changes. Registered
-# here because every entrypoint under cinder.engine composes a trainer config.
+__all__ = [
+    "create_trainer",
+    "create_evaluator",
+    "SampledLoss",
+    "DiceLoss",
+    "MaskedCrossEntropyLoss",
+    "DiceCELoss",
+    "DiceMetric",
+    "IoUMetric",
+    "HausdorffDistanceMetric",
+    "ObjectF1Metric",
+    "ObjectDiceMetric",
+    "ObjectHausdorffMetric",
+    "SlidingWindowInferer",
+    "MultiScaleFlipInferer",
+]
+
+# `${frac:value,fraction}` in the configs is `round(value * fraction)`, so lengths
+# such as the warmup follow the training budget when it is overridden. It is
+# registered here so both entry points, train and eval, can resolve the configs.
 OmegaConf.register_new_resolver(
-    "frac", lambda value, fraction: int(round(float(value) * float(fraction))), replace=True
+    "frac",
+    lambda value, fraction: int(round(float(value) * float(fraction))),
+    replace=True,
 )

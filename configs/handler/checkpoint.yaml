@@ -1,12 +1,11 @@
 checkpoint:
-    _target_: cinder.handlers.checkpoint
+    _target_: cinder.handlers.setup_checkpointing
     _partial_: true
     dirname: ${path.output_dir}/checkpoints
     require_empty: false
     n_saved: 1
-    # null keeps the last checkpoint; a validation metric name (e.g. dice, iou)
-    # keeps the best-scoring one instead. Whichever is used must be the same for
-    # every method in a comparison.
+    # null keeps the latest checkpoint, and a validation metric such as dice the
+    # best one. GlaS and FIVES validate on their test sets, so keep null there.
     score_metric: null
     score_mode: max
     load_from: null

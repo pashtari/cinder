@@ -2,7 +2,9 @@
 
 import math
 
+import pytest
 import torch
+from ignite.exceptions import NotComputableError
 
 from cinder import HausdorffDistanceMetric
 
@@ -60,3 +62,39 @@ if __name__ == "__main__":
     test_hd95_empty_prediction_penalized_with_diagonal()
     test_hd95_averages_over_batch()
     print("All HD95 metric tests passed.")
+
+
+@pytest.mark.parametrize(
+    "metric_cls, expected", [("IoUMetric", 0.25), ("DiceMetric", 1 / 3)]
+)
+def test_multiclass_mean_excludes_ignored_and_absent_classes(metric_cls, expected):
+    import cinder.engine.metrics as metrics
+
+    # Class 0 is ignored, class 3 is absent. Classes 1 and 2 have IoU .5 and 0.
+    logits = torch.tensor([[[[0.0, 0.0]], [[5.0, 5.0]], [[0.0, 0.0]], [[0.0, 0.0]]]])
+    target = torch.tensor([[[1, 2]]])
+    metric = getattr(metrics, metric_cls)(num_classes=4, ignore_index=0)
+
+    assert _run(metric, logits, target) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("metric_cls", ["IoUMetric", "DiceMetric"])
+def test_multiclass_mean_requires_valid_classes(metric_cls):
+    import cinder.engine.metrics as metrics
+
+    metric = getattr(metrics, metric_cls)(num_classes=3, ignore_index=0)
+    with pytest.raises(NotComputableError):
+        metric.compute()
+    metric.update((torch.zeros(1, 3, 2, 2), torch.zeros(1, 2, 2, dtype=torch.long)))
+    with pytest.raises(NotComputableError):
+        metric.compute()
+
+
+def test_multiclass_hd95_ignores_predictions_on_unlabelled_pixels():
+    target = torch.zeros(1, 10, 10, dtype=torch.long)
+    target[:, 2:5, 2:5] = 1
+    logits = torch.zeros(1, 2, 10, 10)
+    logits[:, 1] = 5  # Extra foreground is entirely in the ignored region.
+    metric = HausdorffDistanceMetric(num_classes=2, ignore_index=0)
+
+    assert _run(metric, logits, target) == 0

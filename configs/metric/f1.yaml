@@ -1,6 +1,0 @@
-f1:
-    _target_: cinder.DetectionF1
-    # Probability cut, then connected components, then matching against the
-    # target's per-object labels -- so dataset.instance_labels must be true.
-    threshold: 0.5
-    min_object_size: 0

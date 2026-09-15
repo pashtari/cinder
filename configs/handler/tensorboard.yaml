@@ -1,13 +1,7 @@
 tensorboard:
-    _target_: cinder.handlers.tensorboard
+    _target_: cinder.handlers.setup_tensorboard_logging
     _partial_: true
-    output_path: ${path.output_dir}/tensorboard
-    # Curves are plotted against training iteration, the same unit as the
-    # budget. Training loss and lr are sampled on the shared progress cadence;
-    # validation metrics are written at each evaluation, also stepped by
-    # iteration rather than by the engine's epoch.
+    log_dir: ${path.output_dir}/tensorboard
     log_interval: ${trainer.log_interval}
-    # Log `input | ground-truth | prediction` panels for this many validation
-    # cases after every evaluation (set num_examples: 0 to disable).
-    log_images: true
+    # Validation cases shown as input | target | prediction panels; 0 disables them.
     num_examples: 2
