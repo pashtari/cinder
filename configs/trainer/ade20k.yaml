@@ -1,22 +1,14 @@
 defaults:
     - default
 
-# The ADE20K convention: 160k iterations at global batch 16, evaluated every
-# 16k (mmsegmentation's val_interval). Published baselines are trained to this
-# budget and reported at this cadence, so matching both is what makes the
-# comparison meaningful. At ~2 min per pass this is ~2% overhead anyway.
+# The mmsegmentation schedule: 160k iterations at a global batch of 16, evaluated
+# every 16k, with a 1500-iteration warmup.
 max_iters: 160000
 eval_interval: 16000
-
-# A full train-set pass is 20210 of the 22210 images an evaluation touches --
-# ~91% of its cost, for a diagnostic.
+warmup_iters: 1500
+# Scoring all 20210 training images would dwarf the validation pass.
 eval_train_ratio: 0.05
 
-lr: 1e-4
-
-# The standard ADE20K warmup, 0.94% of the budget.
-warmup_iters: 1500
-
 loss:
-    _target_: torch.nn.CrossEntropyLoss
+    _target_: cinder.MaskedCrossEntropyLoss
     ignore_index: 0

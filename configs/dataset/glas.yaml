@@ -2,19 +2,17 @@ defaults:
     - default
 
 num_classes: 1
-
-# The *_anno.bmp files label each gland separately, which the object-level
-# metrics need and pixel metrics ignore.
+# The *_anno.bmp masks label each gland separately.
 instance_labels: true
-
-test_section: test # testA or testB
+# Validation split: test (A and B together), testA or testB.
+test_split: test
 
 train_datalist:
     _target_: cinder.datasets.glas.create_datalist
     root: ${path.dataset_dir}
-    section: train
+    split: train
 
 val_datalist:
     _target_: cinder.datasets.glas.create_datalist
     root: ${path.dataset_dir}
-    section: ${dataset.test_section}
+    split: ${dataset.test_split}

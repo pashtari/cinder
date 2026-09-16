@@ -1,21 +1,9 @@
-# Multi-scale + flip test-time augmentation.
-#
-# ADE20K results are conventionally reported both single-scale and MS+flip.
-# Report them as separate columns and never compare one against the other:
-#
-#   eval.sh --gpus=1 --dataset=ade20k --inferer=tta ...
-#
-# Costs 12x a single-scale pass (6 scales x 2 flips), so it is for final
-# numbers, not for the validation loop during training.
-_target_: cinder.engine.inferers.MultiScaleFlipInferer
+# Multi-scale and flip test-time augmentation, costing 12 single-scale passes.
+# Report it separately from single-scale results.
+defaults:
+    - _self_
+    - default@inferer
+
+_target_: cinder.MultiScaleFlipInferer
 scales: [0.5, 0.75, 1.0, 1.25, 1.5, 1.75]
 flip: true
-
-inferer:
-    _target_: cinder.engine.inferers.SlidingWindowInferer
-    roi_size: ${dataset.crop_size}
-    sw_batch_size: ${dataset.batch_size}
-    overlap: 0.25
-    mode: gaussian
-    sigma_scale: 0.125
-    amp: ${trainer.amp}

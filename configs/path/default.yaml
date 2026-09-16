@@ -1,14 +1,6 @@
-# path to root directory
-root_dir: ${oc.env:PROJECT_ROOT}
-
-# path to data directory
+# Set by scripts/_launch.sh; defaults to the current directory.
+root_dir: ${oc.env:PROJECT_ROOT,.}
 dataset_dir: ${path.root_dir}/data
-
-# path to logging directory
 log_dir: ${path.root_dir}/logs
-
-# path to output directory, created dynamically by hydra
+# Created by Hydra for each run.
 output_dir: ${hydra:runtime.output_dir}
-
-# path to working directory
-work_dir: ${hydra:runtime.cwd}

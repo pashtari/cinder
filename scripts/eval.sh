@@ -2,29 +2,22 @@
 # Evaluate a trained CINDER checkpoint.
 #
 # Usage:
-#   eval.sh [--gpus=SPEC] [--key=value ...]
+#   scripts/eval.sh [--gpus=SPEC] --handler.checkpoint.load_from=CKPT [--key=value ...]
 #
-# --gpus=SPEC:
-#   (omit)        CPU only
-#   --gpus=1      single GPU (device 0)
-#   --gpus=[1]    specific GPU
-#   --gpus=2      2 GPUs (torchrun)
-#   --gpus=[0,1]  specific GPUs (torchrun)
-#   --gpus=-1     all available GPUs (torchrun)
+# Other arguments are Hydra overrides, with or without the leading "--". Pass
+# the model config the checkpoint was trained with.
 #
-# All other --key=value args are forwarded to Hydra (with -- stripped).
-# A checkpoint must be supplied via --handler.checkpoint.load_from=...
+# Examples:
+#   scripts/eval.sh --gpus=1 --dataset=fives --model=futongate_relu \
+#       --path.dataset_dir=/path/to/FIVES --handler.checkpoint.load_from=/path/to/checkpoint.pt
+#   scripts/eval.sh --gpus=1 --dataset=ade20k --metric=iou --inferer=tta \
+#       --path.dataset_dir=/path/to/ADE20K --handler.checkpoint.load_from=/path/to/checkpoint.pt
 #
-# Example:
-#   eval.sh --gpus=1 --dataset=fives --model=cinder_futon --metric='[dice,hd95]' --path.dataset_dir=/scratch/data/FIVES --handler.checkpoint.load_from=path/to/checkpoint.pt
-#
-# GlaS — report Test A and Test B separately (run once per section), and use the
-# object-level metrics the gland-segmentation literature is written in; the
-# pixel-level dice/hd95 are NOT comparable to published GlaS numbers:
-#   eval.sh --gpus=1 --dataset=glas --metric='[f1,object_dice,object_hausdorff]' --path.dataset_dir=/scratch/data/GlaS --dataset.test_section=testA --handler.checkpoint.load_from=path/to/checkpoint.pt
-#   eval.sh --gpus=1 --dataset=glas --metric='[f1,object_dice,object_hausdorff]' --path.dataset_dir=/scratch/data/GlaS --dataset.test_section=testB --handler.checkpoint.load_from=path/to/checkpoint.pt
+# GlaS reports Test A and Test B separately with object metrics; pixel Dice and
+# HD95 are not comparable with published GlaS results:
+#   scripts/eval.sh --gpus=1 --dataset=glas --dataset.test_split=testA \
+#       --metric='[object_f1,object_dice,object_hausdorff]' \
+#       --path.dataset_dir=/path/to/GlaS --handler.checkpoint.load_from=/path/to/checkpoint.pt
 
 MODULE="cinder.engine.eval"
-USAGE="$(sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//')"
-
 source "$(dirname "${BASH_SOURCE[0]}")/_launch.sh"

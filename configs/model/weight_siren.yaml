@@ -1,0 +1,14 @@
+defaults:
+    - default
+
+inr:
+    _target_: cinder.SIREN
+    hidden_features: 256
+    hidden_layers: 3
+    omega: 30.0
+
+modulator:
+    _target_: cinder.WeightDisplacement
+    conditioner: mlp
+
+sampling_ratio: 0.1

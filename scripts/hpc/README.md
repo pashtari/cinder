@@ -194,13 +194,17 @@ straight to Hydra:
 sbatch --clusters=accelgor --gpus-per-node=1 $CINDER_HPC/jobs/train.slurm GlaS --trainer.max_iters=40000
 ```
 
+Select a preset with `--model=<preset>`: `futongate_relu` (the default),
+`futongate_weight_relu`, `futongate_weight_siren`, `weight_relu`, `weight_futon`
+or `weight_siren`.
+
 Everything for one run lands under `logs/<dataset>/slurm-<jobid>/`:
 
 ```
 logs/glas/slurm-15740615/
 ├── cinder-train-15740615.out / .err     slurm stdout/stderr
 ├── provenance.txt                       commit, GPU, modules, versions
-└── cinder_futon/<timestamp>/            hydra's run dir
+└── futongate_relu/<timestamp>/          hydra's run dir
     ├── train.log
     ├── .hydra/{config,overrides,hydra}.yaml
     ├── tensorboard/

@@ -1,0 +1,27 @@
+defaults:
+    - default
+
+encoder:
+    out_indices: [-4, -3, -2, -1]
+
+inr:
+    _target_: cinder.MLP
+    hidden_layers: 1
+
+modulator:
+    _target_: cinder.ListModulators
+    modulators:
+        - _target_: cinder.WeightDisplacement
+          _partial_: true
+          conditioner: mlp
+        - _target_: cinder.FUTONGate
+          _partial_: true
+          basis:
+              - sinc
+              - num_components: ${dataset.crop_size}
+          combiner:
+              - cp
+              - rank: 256
+          fusion: sum
+
+sampling_ratio: 0.1

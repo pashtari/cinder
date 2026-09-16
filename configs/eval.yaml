@@ -3,13 +3,13 @@ defaults:
     - path: default
     - hydra: default
     - dataset: glas
-    - model: cinder_futon
-    - handler: [checkpoint, proglogger]
-    - trainer: glas
+    - model: futongate_relu
+    - handler: [checkpoint, progress]
+    - trainer: ${dataset}  # for amp, non_blocking and log_interval
     - inferer: default
     - metric: [dice, hd95]
 
 tag: ""
-phase: "eval"
+phase: eval
 experiment: ${hydra:runtime.choices.dataset}_${hydra:runtime.choices.model}
 seed: 42

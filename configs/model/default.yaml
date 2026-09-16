@@ -1,20 +1,28 @@
+# Shared by model/*.yaml, which choose the INR and the modulator.
 _target_: cinder.CINDER
-
 in_channels: 3
 out_channels: ${dataset.num_classes}
 in_size: ${dataset.crop_size}
+freeze_encoder: false
+# Fraction of pixel coordinates decoded per training step.
+sampling_ratio: 1.0
 
 encoder:
     _target_: cinder.TimmEncoder
     _partial_: true
-    model_name: "convnext_small.dinov3_lvd1689m" #"tf_efficientnetv2_m.in21k_ft_in1k" "tf_efficientnetv2_s.in21k_ft_in1k" "tiny_vit_21m_384.dist_in22k_ft_in1k"
+    model_name: convnext_tiny.dinov3_lvd1689m # vit_small_patch16_dinov3.lvd1689m
     pretrained: true
+    # A LayerNorm on each output map.
     normalize: true
-    out_index: null
+    out_indices: [-1]
+    # Fixed-size transformers also need +model.encoder.img_size=${dataset.crop_size}.
 
-cinr:
+inr:
     _target_: ???
     _partial_: true
 
-freeze_encoder: false
-sampling_ratio: 1.0
+# A modulator, or cinder.ListModulators with `modulators` listed innermost first.
+# CINDER passes it the INR and the sizes.
+modulator:
+    _target_: ???
+    _partial_: true

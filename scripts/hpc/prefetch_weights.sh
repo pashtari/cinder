@@ -19,7 +19,7 @@ set -euo pipefail
 
 # Default is the encoder in configs/model/default.yaml. Keep in sync, or pass
 # the model name explicitly.
-MODELS=("${@:-convnext_small.dinov3_lvd1689m}")
+MODELS=("${@:-convnext_tiny.dinov3_lvd1689m}")
 
 # This runs on the login node (zen2), so it must not use litleo's zen4 build --
 # importing torch from it dies with SIGILL. accelgor's stack is zen3 but still

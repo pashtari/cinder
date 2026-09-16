@@ -1,6 +1,8 @@
-_target_: cinder.engine.inferers.SlidingWindowInferer
+_target_: cinder.SlidingWindowInferer
 roi_size: ${dataset.crop_size}
-sw_batch_size: ${dataset.batch_size}
+# Windows decoded at once. A full-resolution 512x512 window costs about 0.8 GiB,
+# so 16 (one 2048x2048 FIVES image) do not fit beside the training state.
+sw_batch_size: 8
 overlap: 0.25
 mode: gaussian
 sigma_scale: 0.125

@@ -3,13 +3,13 @@ defaults:
     - path: default
     - hydra: default
     - dataset: glas
-    - model: cinder_futon
-    - handler: [checkpoint, proglogger, tensorboard]
-    - trainer: glas
+    - model: futongate_relu
+    - handler: [checkpoint, progress, tensorboard]
+    - trainer: ${dataset}  # the dataset's trainer
     - inferer: default
     - metric: [dice, hd95]
 
 tag: ""
-phase: "train"
+phase: train
 experiment: ${hydra:runtime.choices.dataset}_${hydra:runtime.choices.model}
 seed: 42

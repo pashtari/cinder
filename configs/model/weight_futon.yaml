@@ -1,0 +1,20 @@
+defaults:
+    - default
+
+inr:
+    _target_: cinder.FUTON
+    basis:
+        - sinc
+        - num_components: 256
+    combiner:
+        - cp
+        - rank: 256
+    decoder:
+        - mlp
+        - hidden_layers: 1
+
+modulator:
+    _target_: cinder.WeightDisplacement
+    conditioner: mlp
+
+sampling_ratio: 0.1

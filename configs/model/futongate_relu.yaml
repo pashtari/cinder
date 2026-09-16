@@ -1,0 +1,22 @@
+defaults:
+    - default
+
+encoder:
+    out_indices: [-4, -3, -2, -1]
+
+inr:
+    _target_: cinder.MLP
+    hidden_layers: 1
+
+modulator:
+    _target_: cinder.FUTONGate
+    basis:
+        - sinc
+        - num_components: ${dataset.crop_size}
+          grid_size: ${dataset.crop_size}
+    combiner:
+        - cp
+        - rank: 256
+    fusion: sum
+
+sampling_ratio: 1.0
