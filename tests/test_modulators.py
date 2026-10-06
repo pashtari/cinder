@@ -742,7 +742,7 @@ def test_weight_conditioner_displacement_rank_follows_the_positions(positions):
 
 def _displaced(displacement, conds, image):
     """The wrapped model's parameters for one image, displaced by hand."""
-    condition = displacement.flatten_final_map(conds)
+    condition = displacement.flatten_maps(conds)
     return {
         name: displacement.inr.get_parameter(name) + conditioner(condition)[image]
         for name, conditioner in zip(
@@ -840,7 +840,7 @@ def test_weight_displacement_preserves_every_final_map_position(cond_size):
     last = torch.arange(2 * 7 * positions, dtype=torch.float32).reshape(
         2, 7, *cond_size
     )
-    condition = displacement.flatten_final_map([first, last])
+    condition = displacement.flatten_maps([first, last])
     expected = torch.arange(2 * 7, dtype=last.dtype).reshape(
         2, 1, 7
     ) * positions + torch.arange(positions, dtype=last.dtype).reshape(1, positions, 1)
@@ -1128,8 +1128,8 @@ def test_weight_modulators_displace_everything_they_wrap():
     zs = [torch.randn(2, 5, 3, 3), torch.randn(2, 7, 6, 5)]
     with torch.no_grad():
         out = _run(model, coords, zs)
-        outer_deltas = [c(outer.flatten_final_map(zs)) for c in outer.conditioners]
-        inner_deltas = [c(inner.flatten_final_map(zs)) for c in inner.conditioners]
+        outer_deltas = [c(outer.flatten_maps(zs)) for c in outer.conditioners]
+        inner_deltas = [c(inner.flatten_maps(zs)) for c in inner.conditioners]
         for b in range(2):
             weights = {
                 name: inner.inr.get_parameter(name) + d_outer[b] + d_inner[b]
@@ -1481,6 +1481,27 @@ def test_gate_samples_each_map_where_sample_at_maps_the_coordinates():
     # A map sampled at the coordinates themselves needs one grid axis per axis.
     with pytest.raises(ValueError, match="grids need 3 axes"):
         FUTONGate(nn.Identity(), 3, 9, cond_shape, **STAGES, sample_at=[None, views[1]])
+
+
+def test_displacement_can_read_several_maps():
+    """cond_maps concatenates the chosen maps along positions."""
+    cond_shape = ((5, 3, 3), (7, 6, 5), (5, 2, 2))
+    both = WeightDisplacement(
+        nn.Linear(2, 3), 2, 3, cond_shape, conditioner="linear", cond_maps=(0, 2)
+    )
+    assert both.in_shape == (9 + 4, 5)
+    conds = [torch.randn(2, *shape) for shape in cond_shape]
+    condition = both.flatten_maps(conds)
+    assert condition.shape == (2, 13, 5)
+    torch.testing.assert_close(condition[:, :9], conds[0].flatten(2).mT)
+    torch.testing.assert_close(condition[:, 9:], conds[2].flatten(2).mT)
+    assert both(torch.zeros(1, 4, 2), conds).shape == (2, 4, 3)
+
+    last = WeightDisplacement(nn.Linear(2, 3), 2, 3, cond_shape, conditioner="linear")
+    assert last.cond_maps == (2,) and last.in_shape == (4, 5)
+    for bad in ((0, 1), (0, 0)):
+        with pytest.raises(ValueError, match="cond_maps"):
+            WeightDisplacement(nn.Linear(2, 3), 2, 3, cond_shape, cond_maps=bad)
 
 
 def test_camera_divides_by_the_projective_coordinate_in_float32():

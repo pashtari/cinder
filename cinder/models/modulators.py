@@ -607,10 +607,10 @@ def _select_weight_names(
 class WeightDisplacement(BaseModulator):
     """Displace the wrapped model's weight matrices per image.
 
-    The final map ``(B, E, *grid)`` is read as ``(B, positions, E)`` without
-    pooling, whatever its grid rank; an ``(E,)`` map is one position. Each
-    selected matrix gets its own conditioner, which predicts an additive
-    displacement from it. The model then runs once per image under
+    The condition maps, ``(B, E, *grid)`` each, are read as one ``(B, positions,
+    E)`` tensor without pooling, whatever their grid rank; an ``(E,)`` map is
+    one position. Each selected matrix gets its own conditioner, which predicts
+    an additive displacement from it. The model then runs once per image under
     :func:`torch.func.vmap`, so every query in an image uses the same weights.
 
     Args:
@@ -624,6 +624,9 @@ class WeightDisplacement(BaseModulator):
             every matrix; biases and other vectors stay shared across images.
         init_scale: Scale of the selected matrices at initialization. With ``0``,
             each image's matrices start from its displacement alone.
+        cond_maps: Indices of the maps that condition the displacement, which
+            must share a channel count; their positions are concatenated.
+            Defaults to the last map.
 
     Note:
         Under ``vmap``, a FUTON basis in the wrapped model needs
@@ -640,8 +643,16 @@ class WeightDisplacement(BaseModulator):
         conditioner: ModuleSpec = "mlp",
         weight_names: Sequence[str] | None = None,
         init_scale: float = 1.0,
+        cond_maps: Sequence[int] = (-1,),
     ) -> None:
         super().__init__(inr, in_features, out_features, cond_shape)
+        self.cond_maps = tuple(index % len(self.cond_shape) for index in cond_maps)
+        channels = {self.cond_shape[index][0] for index in self.cond_maps}
+        if len(self.cond_maps) != len(set(self.cond_maps)) or len(channels) != 1:
+            raise ValueError(
+                "cond_maps must name distinct maps with one channel count, got "
+                f"{tuple(cond_maps)} for cond_shape {self.cond_shape}"
+            )
         self.inr = self.build_inr(in_features)
         self.weight_names = _select_weight_names(self.inr, weight_names)
         if init_scale != 1.0:
@@ -661,20 +672,23 @@ class WeightDisplacement(BaseModulator):
 
     @property
     def in_shape(self) -> tuple[int, int]:
-        """Shape ``(positions, E)`` of the flattened final map."""
-        channels, *grid = self.cond_shape[-1]
-        return (prod(grid), channels)
+        """Shape ``(positions, E)`` of the flattened condition maps."""
+        shapes = [self.cond_shape[index] for index in self.cond_maps]
+        return (sum(prod(shape[1:]) for shape in shapes), shapes[0][0])
 
-    def flatten_final_map(self, conds: Sequence[Tensor]) -> Tensor:
-        """Return the final map as a ``(B, positions, E)`` view."""
-        final = conds[-1]
-        positions, channels = self.in_shape
+    def flatten_maps(self, conds: Sequence[Tensor]) -> Tensor:
+        """Return the condition maps as one ``(B, positions, E)`` tensor."""
+        channels = self.in_shape[1]
         # reshape, not flatten(2): a channel-only (B, E) map is one position.
-        return final.reshape(final.shape[0], channels, positions).mT
+        flat = [
+            conds[index].reshape(conds[index].shape[0], channels, -1).mT
+            for index in self.cond_maps
+        ]
+        return flat[0] if len(flat) == 1 else torch.cat(flat, dim=1)
 
     def forward(self, coords: Tensor, conds: Tensor | Sequence[Tensor]) -> Tensor:
         conds = self.check_inputs(coords, conds)
-        condition = self.flatten_final_map(conds)
+        condition = self.flatten_maps(conds)
         # attrgetter, not get_parameter: an outer weight modulator's
         # functional_call swaps the parameters for plain tensors.
         params = {
