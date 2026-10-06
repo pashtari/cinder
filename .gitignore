@@ -29,6 +29,7 @@ dist/
 # --- test / tooling caches ---
 .pytest_cache/
 .ruff_cache/
+.ipynb_checkpoints/
 
 # --- IDE ---
 .vscode/

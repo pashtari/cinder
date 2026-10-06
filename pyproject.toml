@@ -57,6 +57,8 @@ train = [
 ]
 # The config tests build models through Hydra.
 test = ["pytest>=7.0", "cinder[train]"]
+# The walkthrough in notebooks/.
+notebook = ["cinder[train]", "jupyter", "matplotlib", "pandas"]
 
 [project.urls]
 Homepage = "https://github.com/pashtari/cinder"

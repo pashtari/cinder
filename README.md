@@ -75,6 +75,11 @@ CINDER builds the encoder, reads the shapes of its maps, and sizes the modulator
 and INR to match. The example runs offline; set `pretrained=True` for pretrained
 encoder weights.
 
+[`notebooks/glas_segmentation.ipynb`](notebooks/glas_segmentation.ipynb) walks
+through a full experiment: it trains a FUTON gate over a ReLU MLP on GlaS, with
+and without weight modulation, scores both on Test A and Test B, and decodes
+the INR off the pixel grid (`pip install -e ".[notebook]"`).
+
 ## Training and evaluation
 
 Experiments are configured with [Hydra](https://hydra.cc) in `configs/`:
