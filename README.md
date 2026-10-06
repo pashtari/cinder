@@ -149,6 +149,11 @@ model with `build_inr`, and can be added to `MODULATORS`. A model config names a
 single modulator directly, as in `futongate_relu`, or `cinder.ListModulators`
 with a list, as in `futongate_weight_relu`.
 
+**Grids.** CINDER decodes the pixel grid of its input by default. `out_size`
+decodes another grid instead, such as a CT volume from its X-rays: the input
+modulators then read each map through `sample_at`, one coordinate map per map,
+such as a pinhole `Camera`, and `chunk_size` bounds the memory of large grids.
+
 **Specs.** Components such as the INR, basis, combiner, fusion and conditioner
 accept a registry key, a `(key, parameters)` pair, a factory or a module.
 

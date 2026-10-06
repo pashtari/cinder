@@ -8,7 +8,12 @@ from torch import nn
 
 from cinder.models.cinder import CINDER
 from cinder.models.encoders import BaseEncoder
-from cinder.models.modulators import FUTONGate, ListModulators, WeightDisplacement
+from cinder.models.modulators import (
+    Camera,
+    FUTONGate,
+    ListModulators,
+    WeightDisplacement,
+)
 
 
 class TinyEncoder(BaseEncoder):
@@ -155,3 +160,43 @@ def test_modulator_is_required():
         build_model()
     with pytest.raises(ValueError, match="at least one"):
         build_model(modulator=partial(ListModulators, modulators=[]))
+
+
+def test_cinder_decodes_a_volume_from_image_maps_through_a_camera():
+    # The camera drops the third axis, so each point reads the maps at (z, y).
+    camera = Camera(torch.tensor([[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 0, 1.0]]))
+    model = CINDER(
+        in_channels=3,
+        out_channels=2,
+        encoder=TinyEncoder,
+        inr=("mlp", {"hidden_features": 8, "hidden_layers": 1}),
+        modulator=("futon", {**INPUT[1], "sample_at": [camera]}),
+        in_size=(6, 8),
+        out_size=(4, 5, 3),
+        sampling_ratio=0.5,
+    )
+    x = torch.randn(2, 3, 6, 8)
+    model.eval()
+    assert model(x).shape == (2, 2, 4, 5, 3)
+    model.train()
+    out = model(x)
+    assert out.shape == (2, 2, 30) and model.sample_indices.max() < 60
+
+    with pytest.raises(ValueError, match="out_size"):
+        build_model(modulator=INPUT, out_size=(0, 3))
+
+
+def test_cinder_decodes_its_input_grid_by_default():
+    model = build_model(modulator=INPUT)
+    assert model.out_size == model.in_size == (6, 8)
+
+
+def test_cinder_decodes_in_chunks_to_the_same_values():
+    torch.manual_seed(0)
+    whole = build_model(modulator=INPUT).eval()
+    torch.manual_seed(0)
+    chunked = build_model(modulator=INPUT, chunk_size=7).eval()
+    x = torch.randn(2, 3, 6, 8)
+    torch.testing.assert_close(chunked(x), whole(x))
+    with pytest.raises(ValueError, match="chunk_size"):
+        build_model(modulator=INPUT, chunk_size=0)

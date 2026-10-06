@@ -16,6 +16,7 @@ from .inrs import (
 )
 from .modulators import (
     BaseModulator,
+    Camera,
     FUTONGate,
     ListModulators,
     WeightDisplacement,
@@ -39,4 +40,5 @@ __all__ = [
     "ListModulators",
     "FUTONGate",
     "WeightDisplacement",
+    "Camera",
 ]

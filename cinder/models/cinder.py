@@ -1,5 +1,7 @@
 """CINDER: Conditioned Implicit Neural DecodeR for dense prediction."""
 
+from collections.abc import Sequence
+
 import torch
 from torch import Tensor, nn
 
@@ -23,7 +25,9 @@ class CINDER(nn.Module):
     """Decode every pixel with an INR conditioned on the image's encoder maps.
 
     The encoder turns an image into feature maps ``z``, and the modulator decodes
-    each pixel coordinate ``x`` as ``y = INR_theta(z)(phi(x, z))``.
+    each pixel coordinate ``x`` as ``y = INR_theta(z)(phi(x, z))``. With
+    ``out_size``, it decodes the coordinates of another grid instead, such as a
+    CT volume from its X-rays.
 
     Components are passed as factories so that CINDER can size them: the encoder
     is built with ``in_channels``, and the modulator with the INR spec, the
@@ -41,13 +45,20 @@ class CINDER(nn.Module):
             :data:`~cinder.models.modulators.MODULATORS`; compose several with a
             :class:`~cinder.models.modulators.ListModulators` factory.
         in_size: Spatial size ``(H, W)`` of each input image or inference window.
+        out_size: Size of the decoded coordinate grid, ``in_size`` by default. A
+            grid with other axes than the image, such as a volume, needs a
+            modulator that maps its coordinates to the maps, as ``sample_at``
+            does.
         freeze_encoder: Freeze the encoder and keep it in evaluation mode.
-        sampling_ratio: Fraction of pixel coordinates decoded per training step.
+        sampling_ratio: Fraction of the grid's coordinates decoded per training step.
+        chunk_size: Coordinates the modulator decodes at a time, all of them by
+            default; chunks bound the memory of large grids, such as volumes.
 
     Shape:
         - Input: ``(B, in_channels, H, W)``.
-        - Output: ``(B, out_channels, H, W)``, or ``(B, out_channels, N)`` for the
-          ``N`` coordinates sampled in training when ``sampling_ratio < 1``.
+        - Output: ``(B, out_channels, *out_size)``, or ``(B, out_channels, N)``
+          for the ``N`` coordinates sampled in training when
+          ``sampling_ratio < 1``.
 
     Attributes:
         sample_indices: Flat indices of the coordinates decoded by the last
@@ -65,8 +76,10 @@ class CINDER(nn.Module):
         inr: ModuleSpec,
         modulator: ModuleSpec,
         in_size: tuple[int, int] = (512, 512),
+        out_size: Sequence[int] | None = None,
         freeze_encoder: bool = False,
         sampling_ratio: float = 1.0,
+        chunk_size: int | None = None,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -76,8 +89,15 @@ class CINDER(nn.Module):
             raise ValueError(
                 f"in_size must contain two positive dimensions, got {in_size}"
             )
+        self.out_size = self.in_size if out_size is None else tuple(out_size)
+        if not self.out_size or any(size < 1 for size in self.out_size):
+            raise ValueError(
+                f"out_size must contain positive dimensions, got {out_size}"
+            )
         if not 0.0 < sampling_ratio <= 1.0:
             raise ValueError(f"sampling_ratio must be in (0, 1], got {sampling_ratio}")
+        if chunk_size is not None and chunk_size < 1:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
 
         # Check the specs before building a possibly pretrained encoder.
         for name, spec in (
@@ -99,7 +119,7 @@ class CINDER(nn.Module):
 
         cond_shape = self.encoder.get_output_shapes(self.in_size)
         sizes = dict(
-            in_features=len(self.in_size),
+            in_features=len(self.out_size),
             out_features=out_channels,
             cond_shape=tuple(tuple(shape) for shape in cond_shape),
         )
@@ -107,7 +127,8 @@ class CINDER(nn.Module):
         check_sizes(self.modulator, "modulator", **sizes)
 
         self.sampling_ratio = sampling_ratio
-        self.register_buffer("coords", create_coordinates(self.in_size))
+        self.chunk_size = chunk_size
+        self.register_buffer("coords", create_coordinates(self.out_size))
         self.sample_indices: Tensor | None = None
 
     def train(self, mode: bool = True) -> "CINDER":
@@ -126,7 +147,7 @@ class CINDER(nn.Module):
         return flat_coords[indices], indices
 
     def forward(self, x: Tensor) -> Tensor:
-        """Predict every pixel, or the sampled coordinates during training."""
+        """Predict the whole grid, or the sampled coordinates during training."""
         if x.ndim != 4:
             raise ValueError(f"`x` must be 4D, got {x.ndim}")
         if x.shape[1] != self.in_channels:
@@ -146,8 +167,13 @@ class CINDER(nn.Module):
         else:
             coords = self.coords
             self.sample_indices = None
-        # Decode flat queries shared by the batch, (1, M, 2), so full grids and
+        # Decode flat queries shared by the batch, (1, M, D), so full grids and
         # sampled coordinates take the same kernels.
         *query_shape, dim = coords.shape
-        out = self.modulator(coords.reshape(1, -1, dim), feature_maps)  # (B, M, C)
+        queries = coords.reshape(1, -1, dim)
+        if self.chunk_size is None:
+            out = self.modulator(queries, feature_maps)  # (B, M, C)
+        else:
+            chunks = queries.split(self.chunk_size, dim=1)
+            out = torch.cat([self.modulator(q, feature_maps) for q in chunks], dim=1)
         return out.reshape(x.shape[0], *query_shape, self.out_channels).movedim(-1, 1)

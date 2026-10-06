@@ -35,6 +35,7 @@ from .utils import ModuleSpec, build_module, check_sizes
 __all__ = [
     "BaseModulator",
     "GridSampler",
+    "Camera",
     "ProductFusion",
     "ResidualFusion",
     "SumFusion",
@@ -234,6 +235,79 @@ class GridSampler(nn.Module):
         return queried.reshape(batch, *query_shape, num_features).to(out_dtype)
 
 
+class Camera(nn.Module):
+    """Project ``(*, 3)`` coordinates to a view's ``(*, 2)`` grid coordinates.
+
+    A pinhole camera with a ``3 x 4`` matrix ``P`` maps ``x`` to
+    ``P[:2] x~ / P[2] x~``, where ``x~ = (x, 1)``, both in CINDER's coordinates,
+    ``[-1, 1]`` per axis. As ``sample_at`` of :class:`FUTONGate`, it reads a
+    view's maps where each point projects. The projection runs in float32 even
+    under autocast, since a half-precision division would move the samples by a
+    fraction of a pixel.
+
+    Args:
+        matrix: The ``(3, 4)`` camera matrix.
+    """
+
+    def __init__(self, matrix: Tensor) -> None:
+        super().__init__()
+        self.register_buffer("matrix", torch.as_tensor(matrix, dtype=torch.float32))
+
+    @classmethod
+    def fit(cls, points: Tensor, projections: Tensor) -> "Camera":
+        """Fit the camera to ``(N, 3)`` points and their ``(N, 2)`` projections.
+
+        The direct linear transform finds the matrix, up to scale, as the null
+        vector of the projection constraints, in float64.
+        """
+        points, projections = points.double(), projections.double()
+        homogeneous = torch.cat([points, torch.ones_like(points[:, :1])], dim=1)
+        zeros = torch.zeros_like(homogeneous)
+        constraints = torch.cat(
+            [
+                torch.cat([homogeneous, zeros, -projections[:, :1] * homogeneous], 1),
+                torch.cat([zeros, homogeneous, -projections[:, 1:] * homogeneous], 1),
+            ]
+        )
+        matrix = torch.linalg.svd(constraints, full_matrices=False).Vh[-1].view(3, 4)
+        return cls(matrix / matrix[2, :3].norm())
+
+    def forward(self, coords: Tensor) -> Tensor:
+        with torch.autocast(device_type=coords.device.type, enabled=False):
+            projected = coords.float() @ self.matrix[:, :3].T + self.matrix[:, 3]
+            return projected[..., :2] / projected[..., 2:]
+
+
+def _coordinate_maps(
+    sample_at: Sequence[ModuleSpec | None] | None,
+    cond_shape: tuple[tuple[int, ...], ...],
+    in_features: int,
+) -> nn.ModuleList:
+    """Build the module that maps the coordinates to each map's grid.
+
+    ``None``, for every map or one, samples at the coordinates themselves, so that
+    map needs ``in_features`` grid axes.
+    """
+    if sample_at is None:
+        sample_at = [None] * len(cond_shape)
+    if len(sample_at) != len(cond_shape):
+        raise ValueError(
+            f"sample_at needs one entry per map, got {len(sample_at)} "
+            f"for {len(cond_shape)} maps"
+        )
+    if any(
+        spec is None and len(shape) != in_features + 1
+        for shape, spec in zip(cond_shape, sample_at)
+    ):
+        raise ValueError(
+            f"maps are sampled at {in_features}D coordinates, so "
+            f"cond_shape grids need {in_features} axes, got {cond_shape}"
+        )
+    return nn.ModuleList(
+        nn.Identity() if spec is None else build_module(spec) for spec in sample_at
+    )
+
+
 # Fusions ------------------------------------------------------------------------------
 
 
@@ -335,9 +409,9 @@ class FUTONGate(BaseModulator):
         y = inr(LayerNorm(encoding(x) * fusion([sample(proj_s(z_s), x) for s])))
 
     Each map is projected to the encoding width ``F`` and sampled on its own
-    grid, so every map needs ``D`` grid axes, and the coordinates must be
-    shared by the batch. The wrapped model reads the gated features of each
-    image as its coordinates.
+    grid, at the query coordinates or where ``sample_at`` maps them, and the
+    coordinates must be shared by the batch. The wrapped model reads the gated
+    features of each image as its coordinates.
 
     Args:
         inr: Spec of the wrapped model, built with ``in_features=F``.
@@ -348,6 +422,12 @@ class FUTONGate(BaseModulator):
         combiner: Combiner spec from :data:`~cinder.models.inrs.COMBINERS`.
         bias: Add a bias to each map projection.
         fusion: Spec from :data:`FUSIONS`.
+        sample_at: One spec per map of a module that maps the ``(*, D)``
+            coordinates to the ``(*, d)`` grid coordinates where the map is
+            sampled, for maps on another grid than the queries, such as the
+            camera of an X-ray view of a volume. ``None``, for every map or one,
+            samples at the coordinates themselves, so that map needs ``D`` grid
+            axes.
     """
 
     def __init__(
@@ -361,16 +441,13 @@ class FUTONGate(BaseModulator):
         combiner: ModuleSpec = ("cp", {"rank": 256}),
         bias: bool = False,
         fusion: ModuleSpec = "sum",
+        sample_at: Sequence[ModuleSpec | None] | None = None,
     ) -> None:
         super().__init__(inr, in_features, out_features, cond_shape)
-        if any(len(shape) != in_features + 1 for shape in self.cond_shape):
-            raise ValueError(
-                f"the gate samples maps at {in_features}D coordinates, so "
-                f"cond_shape grids need {in_features} axes, got {self.cond_shape}"
-            )
         self.encoding = FUTONEncoding(in_features, basis, combiner)
         num_features = self.encoding.out_features
         self.sampler = GridSampler()
+        self.sample_at = _coordinate_maps(sample_at, self.cond_shape, in_features)
         sizes = dict(num_maps=len(self.cond_shape), out_features=num_features)
         self.fusion = build_module(fusion, FUSIONS, **sizes)
         check_sizes(self.fusion, "fusion", **sizes)
@@ -397,11 +474,11 @@ class FUTONGate(BaseModulator):
     def _fuse_maps(self, coords: Tensor, conds: Sequence[Tensor]) -> Tensor:
         """Fuse the maps sampled at ``coords`` into the ``(B, *, F)`` gate."""
         factors = []
-        for cond, projection in zip(conds, self.projections):
+        for cond, projection, sample_at in zip(conds, self.projections, self.sample_at):
             # Project before sampling: interpolation is linear, and a map has far
             # fewer positions than the query grid.
             projected = projection(cond.movedim(1, -1)).movedim(-1, 1)  # (B, F, *grid)
-            factors.append(self.sampler(coords, projected))  # (B, *, F)
+            factors.append(self.sampler(sample_at(coords), projected))  # (B, *, F)
         return self.fusion(factors)
 
 

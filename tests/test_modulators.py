@@ -23,6 +23,7 @@ from cinder.models.modulators import (
     FUSIONS,
     AttentionFusion,
     BaseModulator,
+    Camera,
     FUTONGate,
     GridSampler,
     LinearWeightConditioner,
@@ -1443,3 +1444,63 @@ def test_condition_guard_rejects_mixed_devices_without_using_a_gpu(kind):
         module = _weight_modulator()
     with pytest.raises(ValueError, match="same device"):
         _run(module, _grid(2, 3), conds)
+
+
+class _SelectAxes(nn.Module):
+    """Parallel projection onto the given coordinate axes."""
+
+    def __init__(self, axes):
+        super().__init__()
+        self.axes = list(axes)
+
+    def forward(self, coords):
+        return coords[..., self.axes]
+
+
+def test_gate_samples_each_map_where_sample_at_maps_the_coordinates():
+    """3D queries, two 2D maps: each view is sampled at its own projection."""
+    torch.manual_seed(0)
+    cond_shape = ((5, 6, 7), (5, 6, 7))
+    views = [_SelectAxes((0, 2)), partial(_SelectAxes, (1, 2))]  # module or factory
+    gate = FUTONGate(nn.Identity(), 3, 9, cond_shape, **STAGES, sample_at=views)
+    coords = torch.rand(1, 11, 3) * 2 - 1
+    conds = [torch.randn(2, 5, 6, 7), torch.randn(2, 5, 6, 7)]
+    out = gate(coords, conds)
+    assert out.shape == (2, 11, 9)
+
+    # Sampling the first view at (x, z) and the second at (y, z) by hand.
+    factors = [
+        gate.sampler(coords[0][:, axes], projection(z.movedim(1, -1)).movedim(-1, 1))
+        for z, projection, axes in zip(conds, gate.projections, ([0, 2], [1, 2]))
+    ]
+    expected = gate.norm(gate.encoding(coords) * sum(factors))
+    torch.testing.assert_close(out, expected)
+
+    with pytest.raises(ValueError, match="one entry per map"):
+        FUTONGate(nn.Identity(), 3, 9, cond_shape, **STAGES, sample_at=views[:1])
+    # A map sampled at the coordinates themselves needs one grid axis per axis.
+    with pytest.raises(ValueError, match="grids need 3 axes"):
+        FUTONGate(nn.Identity(), 3, 9, cond_shape, **STAGES, sample_at=[None, views[1]])
+
+
+def test_camera_divides_by_the_projective_coordinate_in_float32():
+    matrix = torch.tensor(
+        [[2.0, 0.0, 0.0, 0.1], [0.0, 3.0, 0.0, -0.2], [0.0, 0.0, 0.5, 4.0]]
+    )
+    coords = torch.rand(6, 3)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        projected = Camera(matrix)(coords)
+    homogeneous = coords @ matrix[:, :3].T + matrix[:, 3]
+    assert projected.dtype == torch.float32
+    torch.testing.assert_close(projected, homogeneous[:, :2] / homogeneous[:, 2:])
+
+
+def test_camera_fit_recovers_the_projection_of_points():
+    truth = Camera(
+        torch.tensor(
+            [[1.2, 0.1, 0.0, 0.05], [0.0, 0.9, 0.2, -0.1], [0.05, 0.0, 0.1, 3.0]]
+        )
+    )
+    points = torch.rand(200, 3, generator=torch.Generator().manual_seed(0)) * 2 - 1
+    fitted = Camera.fit(points, truth(points))
+    torch.testing.assert_close(fitted(points), truth(points), atol=1e-5, rtol=0)
