@@ -19,7 +19,9 @@ from cinder.models.inrs import (
     CosineBasis,
     CPCombiner,
     HadamardCombiner,
+    HashEncoding,
     LanczosBasis,
+    PositionalEncoding,
     SincBasis,
     TRCombiner,
     TriangleBasis,
@@ -740,3 +742,64 @@ class TestSparseIsFaster:
                 torch.cuda.synchronize()
                 times[sparse] = time.perf_counter() - t0
         assert times[True] < times[False], times
+
+
+# Encodings ----------------------------------------------------------------------------
+
+
+def test_hash_encoding_indexes_coarse_levels_densely_and_hashes_fine_ones():
+    encoding = HashEncoding(
+        3,
+        num_levels=4,
+        features_per_level=2,
+        log2_hashmap_size=12,
+        base_resolution=4,
+        max_resolution=32,
+    )
+    for resolution, size in zip(encoding.resolutions, encoding.table_sizes):
+        assert size == -(-min(resolution**3, 2**12) // 8) * 8  # rounded up to 8
+    assert encoding.embeddings.shape == (sum(encoding.table_sizes), 2)
+    out = encoding(torch.rand(5, 7, 3) * 2 - 1)
+    assert out.shape == (5, 7, encoding.out_features) == (5, 7, 8)
+
+
+def test_hash_encoding_reads_a_vertex_of_a_dense_level_exactly():
+    encoding = HashEncoding(
+        2,
+        num_levels=1,
+        features_per_level=1,
+        log2_hashmap_size=10,
+        base_resolution=4,
+        max_resolution=4,
+    )
+    rows = torch.arange(encoding.embeddings.numel(), dtype=torch.float32)
+    with torch.no_grad():
+        encoding.embeddings.copy_(rows.view_as(encoding.embeddings))
+    # The level reads unit positions at u * scale + 0.5, so vertex k sits at
+    # u = (k - 0.5) / scale; dense rows run with the first coordinate fastest.
+    vertex = torch.tensor([[1.0, 2.0]])
+    x = (vertex - 0.5) / encoding.scales[0] * 2 - 1
+    expected = 1 + encoding.resolutions[0] * 2
+    assert encoding(x).item() == pytest.approx(expected, abs=1e-4)
+
+
+def test_hash_encoding_trains_its_tables():
+    encoding = HashEncoding(
+        3, num_levels=2, log2_hashmap_size=8, base_resolution=2, max_resolution=8
+    )
+    encoding(torch.rand(10, 3) * 2 - 1).sum().backward()
+    assert encoding.embeddings.grad.abs().sum() > 0
+
+
+def test_hash_encoding_takes_one_to_three_axes():
+    with pytest.raises(ValueError, match="in_features"):
+        HashEncoding(4)
+
+
+def test_positional_encoding_lists_the_input_then_the_sines_and_cosines():
+    encoding = PositionalEncoding(2, num_frequencies=3)
+    x = torch.tensor([[0.5, -0.25]])
+    angles = (x.unsqueeze(-1) * torch.tensor([1.0, 2.0, 4.0])).flatten(-2)
+    expected = torch.cat([x, angles.sin(), angles.cos()], dim=-1)
+    assert encoding.out_features == 14
+    torch.testing.assert_close(encoding(x), expected)

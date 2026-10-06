@@ -1,10 +1,12 @@
 """Implicit neural representations: coordinates ``(*, C)`` to values ``(*, D)``.
 
 Ported from ``neurofield.models`` (``mlp``, ``siren``, ``finer``, ``gauss``,
-``wire``, ``rff`` and ``futon``) with unchanged implementations, except that
-:class:`WIRE` is neurofield's real-valued ``RealWIRE``, the polynomial bases are
+``wire``, ``rff``, ``pemlp``, ``instant_ngp`` and ``futon``) with unchanged
+implementations, except that :class:`WIRE` is neurofield's real-valued
+``RealWIRE``, ``pemlp`` and ``instant_ngp`` contribute only their encodings,
+:class:`PositionalEncoding` and :class:`HashEncoding`, the polynomial bases are
 omitted, and :class:`FUTONEncoding` factors ``combiner(basis(x))`` out of
-:class:`FUTON` so that :class:`~cinder.models.modulators.FUTONGate` can reuse it.
+:class:`FUTON` so that the modulators can reuse it.
 :data:`INRS` lists the networks CINDER builds as
 ``inr(in_features=..., out_features=...)``.
 
@@ -34,9 +36,11 @@ only the few nonzero taps per point, and the combiners contract it directly.
 import math
 from collections.abc import Callable, Sequence
 from functools import reduce
+from itertools import product
 from operator import mul
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -57,6 +61,8 @@ __all__ = [
     "WIRE",
     "RFFEncoding",
     "RFF",
+    "PositionalEncoding",
+    "HashEncoding",
     "CosineBasis",
     "SincBasis",
     "TriangleBasis",
@@ -512,6 +518,189 @@ class RFF(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.mlp(self.encoding(x))
+
+
+# Positional encoding ------------------------------------------------------------------
+
+
+class PositionalEncoding(nn.Module):
+    """Positional encoding ``[x, sin(2**k * x), cos(2**k * x)]``.
+
+    Uses ``num_frequencies`` bands, with ``k`` starting at zero, without the
+    π factor in NeRF Eq. (4). The input is followed by all sines, then all
+    cosines; within each block, bands vary faster than coordinates.
+    The output width is ``in_features * (2 * num_frequencies + 1)`` and
+    leading input dimensions are preserved. Bands are stored in ``freqs``.
+
+    See Mildenhall et al., "NeRF: Representing Scenes as Neural Radiance
+    Fields for View Synthesis", ECCV 2020.
+    """
+
+    def __init__(self, in_features: int, num_frequencies: int = 10) -> None:
+        super().__init__()
+
+        freqs = 2.0 ** torch.linspace(0, num_frequencies - 1, num_frequencies)
+        self.register_buffer("freqs", freqs)
+
+        self.out_features = in_features * (2 * num_frequencies + 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        projection = x.unsqueeze(-1) * self.freqs
+        return torch.cat(
+            [x, projection.sin().flatten(-2), projection.cos().flatten(-2)], dim=-1
+        )
+
+
+# Instant-NGP --------------------------------------------------------------------------
+
+# tiny-cuda-nn's coherent prime hash factors. The first coordinate is left
+# unscaled (factor 1) for cache coherence.
+_PRIMES = (1, 2654435761, 805459861)
+
+
+def _level_scales(
+    num_levels: int, base_resolution: int, max_resolution: int
+) -> list[float]:
+    """Per-level grid scales, computed in float32 like instant-ngp/tiny-cuda-nn.
+
+    The ceiling of a scale sets the level's resolution, so matching the
+    reference's float32 rounding keeps table sizes identical.
+    """
+    f32 = np.float32
+    ratio = f32(max_resolution) / f32(base_resolution)
+    growth = np.exp(np.log(ratio) / f32(max(num_levels - 1, 1)))
+    log2_growth = np.log2(growth)
+    return [
+        float(f32(2) ** (f32(level) * log2_growth) * f32(base_resolution) - f32(1))
+        for level in range(num_levels)
+    ]
+
+
+class HashEncoding(nn.Module):
+    """Multiresolution hash encoding (Müller et al., SIGGRAPH 2022).
+
+    Level ``l`` scales unit-cube positions by ``N_min * b**l - 1``, with growth
+    ``b = (N_max / N_min) ** (1 / (L - 1))``, and adds a half-cell offset so
+    levels are staggered (paper, Appendix A). Its grid has
+    ``ceil(scale) + 1`` vertices per axis. Grids whose vertices fit in the
+    table are indexed densely; finer grids are hashed. Features of the
+    ``2**C`` surrounding vertices are interpolated multilinearly and
+    concatenated across levels.
+
+    Args:
+        in_features: Number of input coordinates ``C`` (1, 2, or 3).
+        num_levels: Number of resolution levels ``L``.
+        features_per_level: Feature channels ``F`` per table entry.
+        log2_hashmap_size: Base-2 logarithm of the maximum entries ``T`` per level.
+        base_resolution: Coarsest resolution ``N_min``.
+        max_resolution: Finest resolution ``N_max`` over the ``[-1, 1]`` domain;
+            the reference uses 2048 for NeRF and SDFs, ``max(H, W) / 2`` for
+            images, and the voxel resolution for volumes.
+
+    Shape:
+        - Input: :math:`(*, C)` in ``[-1, 1]``.
+        - Output: :math:`(*, L F)`.
+
+    The learnable ``embeddings`` concatenate all levels and start uniformly
+    in ``[-1e-4, 1e-4]``.
+
+    The forward pass handles every level at once, as one batched tensor
+    operation per step rather than a loop over levels: the arithmetic is the
+    same, so the features are identical, but a pass costs a few dozen kernel
+    launches instead of a few hundred, which is what sets the encoding's time
+    on the small batches a ray marcher or a training step feeds it.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        num_levels: int = 16,
+        features_per_level: int = 2,
+        log2_hashmap_size: int = 19,
+        base_resolution: int = 16,
+        max_resolution: int = 2048,
+    ) -> None:
+        super().__init__()
+        if not 1 <= in_features <= len(_PRIMES):
+            raise ValueError(f"in_features must be in [1, {len(_PRIMES)}]")
+        self.in_features = in_features
+        self.num_levels = num_levels
+        self.features_per_level = features_per_level
+
+        self.scales = _level_scales(num_levels, base_resolution, max_resolution)
+        self.resolutions = [math.ceil(scale) + 1 for scale in self.scales]
+        self.table_sizes = [
+            -(-min(resolution**in_features, 2**log2_hashmap_size) // 8) * 8
+            for resolution in self.resolutions
+        ]
+        self.offsets = [0]
+        for size in self.table_sizes[:-1]:
+            self.offsets.append(self.offsets[-1] + size)
+        # The per-level constants as tensors, for the batched forward pass. A
+        # level whose vertices outnumber its table is hashed, the others are
+        # indexed densely.
+        levels = {
+            "level_scales": torch.tensor(self.scales, dtype=torch.float32),
+            "level_resolutions": torch.tensor(self.resolutions, dtype=torch.long),
+            "level_table_sizes": torch.tensor(self.table_sizes, dtype=torch.long),
+            "level_offsets": torch.tensor(self.offsets, dtype=torch.long),
+            "level_hashed": torch.tensor(
+                [
+                    size < resolution**in_features
+                    for resolution, size in zip(self.resolutions, self.table_sizes)
+                ]
+            ),
+        }
+        for name, value in levels.items():
+            self.register_buffer(name, value, persistent=False)
+
+        self.register_buffer(
+            "corners",
+            torch.tensor(list(product((0, 1), repeat=in_features)), dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "primes",
+            torch.tensor(_PRIMES[:in_features], dtype=torch.long),
+            persistent=False,
+        )
+        self.embeddings = nn.Parameter(
+            torch.empty(sum(self.table_sizes), features_per_level).uniform_(-1e-4, 1e-4)
+        )
+
+    @property
+    def out_features(self) -> int:
+        """Number of output features, ``num_levels * features_per_level``."""
+        return self.num_levels * self.features_per_level
+
+    def forward(self, x: Tensor) -> Tensor:
+        batch_shape = x.shape[:-1]
+        unit_x = (x.reshape(-1, self.in_features) + 1) / 2
+
+        # Every level at once: (N, L, C) positions, (N, L, 2^C, C) vertices.
+        position = unit_x.unsqueeze(1) * self.level_scales.view(1, -1, 1) + 0.5
+        grid = position.floor()
+        fraction = (position - grid).unsqueeze(2)
+        vertices = grid.long().unsqueeze(2) + self.corners
+
+        # Spatial hash; the reference's uint32 wraparound only affects bits
+        # above log2(table_size), so int64 arithmetic gives the same index.
+        hashed = vertices * self.primes
+        hash_index = hashed[..., 0]
+        for dim in range(1, self.in_features):
+            hash_index = hash_index ^ hashed[..., dim]
+        # Dense stride index with the first coordinate varying fastest.
+        resolution = self.level_resolutions.view(1, -1, 1)
+        dense_index = vertices[..., -1]
+        for dim in range(self.in_features - 2, -1, -1):
+            dense_index = dense_index * resolution + vertices[..., dim]
+        index = torch.where(self.level_hashed.view(1, -1, 1), hash_index, dense_index)
+        index = index % self.level_table_sizes.view(1, -1, 1)
+
+        corner_features = self.embeddings[self.level_offsets.view(1, -1, 1) + index]
+        weights = torch.where(self.corners.bool(), fraction, 1 - fraction).prod(-1)
+        out = (weights.unsqueeze(-1) * corner_features).sum(2)  # (N, L, F)
+        return out.reshape(*batch_shape, self.out_features)
 
 
 def _broadcast(value: int | Sequence[int], length: int, name: str) -> list[int]:

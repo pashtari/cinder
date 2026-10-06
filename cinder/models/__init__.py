@@ -2,7 +2,18 @@
 
 from .cinder import CINDER
 from .encoders import BaseEncoder, TimmEncoder
-from .inrs import FINER, FUTON, MLP, RFF, SIREN, WIRE, Gauss
+from .inrs import (
+    FINER,
+    FUTON,
+    MLP,
+    RFF,
+    SIREN,
+    WIRE,
+    FUTONEncoding,
+    Gauss,
+    HashEncoding,
+    PositionalEncoding,
+)
 from .modulators import (
     BaseModulator,
     FUTONGate,
@@ -21,6 +32,9 @@ __all__ = [
     "WIRE",
     "RFF",
     "FUTON",
+    "PositionalEncoding",
+    "HashEncoding",
+    "FUTONEncoding",
     "BaseModulator",
     "ListModulators",
     "FUTONGate",
