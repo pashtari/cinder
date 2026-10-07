@@ -46,6 +46,8 @@ dependencies = [
     "numpy>=1.24.0",
     "scipy>=1.10.0",
     "Pillow>=10.0.0",
+    # The progress bar of cinder.fit.
+    "tqdm>=4.60",
 ]
 
 [project.optional-dependencies]

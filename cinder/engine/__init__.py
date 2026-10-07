@@ -2,7 +2,7 @@
 
 from omegaconf import OmegaConf
 
-from .engines import create_evaluator, create_trainer
+from .engines import create_evaluator, create_trainer, fit
 from .inferers import MultiScaleFlipInferer, SlidingWindowInferer
 from .losses import DiceCELoss, DiceLoss, MaskedCrossEntropyLoss, SampledLoss
 from .metrics import (
@@ -17,6 +17,7 @@ from .metrics import (
 __all__ = [
     "create_trainer",
     "create_evaluator",
+    "fit",
     "SampledLoss",
     "DiceLoss",
     "MaskedCrossEntropyLoss",

@@ -107,7 +107,9 @@ Each run writes its config, log, checkpoints and TensorBoard files to
 `logs/<dataset>/<tag>/<model>/<timestamp>/`. The dataset layouts are described in
 `cinder/datasets/`. GlaS is reported on Test A and Test B separately with the
 object metrics, and ADE20K with `metric=iou`, single-scale and `inferer=tta`
-separately. The [HPC guide](scripts/hpc/README.md) covers cluster jobs.
+separately. The [HPC guide](scripts/hpc/README.md) covers cluster jobs. In a
+notebook, `cinder.fit` trains a model with the same recipe and records its
+training loss and validation metrics.
 
 The model configs define six variants:
 

@@ -16,6 +16,7 @@ from .engine import (
     SlidingWindowInferer,
     create_evaluator,
     create_trainer,
+    fit,
 )
 from .models import (
     CINDER,
@@ -64,6 +65,7 @@ __all__ = [
     "SegmentationDataset",
     "create_trainer",
     "create_evaluator",
+    "fit",
     "SampledLoss",
     "DiceLoss",
     "MaskedCrossEntropyLoss",
