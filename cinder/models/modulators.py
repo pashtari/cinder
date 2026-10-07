@@ -5,9 +5,10 @@ coordinates ``x`` and encoder maps ``z``. Every modulator follows one protocol,
 :class:`BaseModulator`: ``forward(coords, conds) -> (B, *, out_features)``, where
 coordinates with a batch axis of 1 are shared by the batch.
 
-- **Input modulators** change what the INR reads. :class:`FUTONGate` gates a
-  coordinate encoding with the maps sampled at each query, so the condition varies
-  within an image.
+- **Input modulators** change what the INR reads, so the condition varies within
+  an image. :class:`FUTONGate` gates a coordinate encoding with the maps sampled
+  at each query, and :class:`FeatureConcat` concatenates the samples with a code
+  of the query.
 - **Weight modulators** change the INR's parameters. :class:`WeightDisplacement`
   displaces each matrix per image, so the condition selects a function.
 
@@ -42,6 +43,7 @@ __all__ = [
     "ConvexFusion",
     "AttentionFusion",
     "FUTONGate",
+    "FeatureConcat",
     "WeightConditioner",
     "LinearWeightConditioner",
     "MLPWeightConditioner",
@@ -240,10 +242,10 @@ class Camera(nn.Module):
 
     A pinhole camera with a ``3 x 4`` matrix ``P`` maps ``x`` to
     ``P[:2] x~ / P[2] x~``, where ``x~ = (x, 1)``, both in CINDER's coordinates,
-    ``[-1, 1]`` per axis. As ``sample_at`` of :class:`FUTONGate`, it reads a
-    view's maps where each point projects. The projection runs in float32 even
-    under autocast, since a half-precision division would move the samples by a
-    fraction of a pixel.
+    ``[-1, 1]`` per axis. As ``sample_at`` of :class:`FUTONGate` or
+    :class:`FeatureConcat`, it reads a view's maps where each point projects.
+    The projection runs in float32 even under autocast, since a half-precision
+    division would move the samples by a fraction of a pixel.
 
     Args:
         matrix: The ``(3, 4)`` camera matrix.
@@ -482,6 +484,69 @@ class FUTONGate(BaseModulator):
         return self.fusion(factors)
 
 
+class FeatureConcat(BaseModulator):
+    """Concatenate the maps sampled at the coordinates with a code of them.
+
+    For query coordinates ``x`` and maps ``z_s``::
+
+        y = inr(concat(sample(z_1, x), ..., sample(z_S, x), encoding(x)))
+
+    Unlike :class:`FUTONGate`, the maps are sampled as they are, and the wrapped
+    model mixes them with the code in its first layer, as SPIDER does. Each map is
+    sampled on its own grid, at the query coordinates or where ``sample_at`` maps
+    them, and the coordinates must be shared by the batch.
+
+    Args:
+        inr: Spec of the wrapped model, built with ``in_features`` set to the
+            channels of all maps plus the code's width.
+        in_features: Coordinate dimension ``D``.
+        out_features: Prediction width.
+        cond_shape: See :class:`BaseModulator`.
+        encoding: Spec of the code, built as ``encoding(D)``, such as
+            :class:`~cinder.models.inrs.HashEncoding`; it must expose
+            ``out_features``. ``None`` concatenates the coordinates themselves.
+        sample_at: See :class:`FUTONGate`.
+    """
+
+    def __init__(
+        self,
+        inr: ModuleSpec,
+        in_features: int,
+        out_features: int,
+        cond_shape: Sequence[int] | Sequence[Sequence[int]],
+        *,
+        encoding: ModuleSpec | None = None,
+        sample_at: Sequence[ModuleSpec | None] | None = None,
+    ) -> None:
+        super().__init__(inr, in_features, out_features, cond_shape)
+        if encoding is None:
+            self.encoding, code_width = nn.Identity(), in_features
+        else:
+            self.encoding = build_module(encoding, None, in_features)
+            code_width = self.encoding.out_features
+        self.sampler = GridSampler()
+        self.sample_at = _coordinate_maps(sample_at, self.cond_shape, in_features)
+        width = sum(shape[0] for shape in self.cond_shape) + code_width
+        self.inr = self.build_inr(width)
+
+    def forward(self, coords: Tensor, conds: Tensor | Sequence[Tensor]) -> Tensor:
+        conds = self.check_inputs(coords, conds)
+        if coords.shape[0] != 1:
+            raise ValueError(
+                "the concatenation needs coordinates shared by the batch, (1, *, D)"
+            )
+        sampled = [
+            self.sampler(sample_at(coords[0]), cond)  # (B, *, E)
+            for cond, sample_at in zip(conds, self.sample_at)
+        ]
+        code = self.encoding(coords)  # (1, *, C)
+        code = code.expand(sampled[0].shape[0], *code.shape[1:])
+        features = torch.cat([*sampled, code], dim=-1)
+        if isinstance(self.inr, BaseModulator):
+            return self.inr(features, conds)
+        return self.inr(features)
+
+
 # Weight modulation --------------------------------------------------------------------
 
 
@@ -715,6 +780,7 @@ class WeightDisplacement(BaseModulator):
 # Modulators, built with ``inr``, ``in_features``, ``out_features`` and ``cond_shape``.
 MODULATORS: dict[str, type[nn.Module]] = {
     "futon": FUTONGate,
+    "concat": FeatureConcat,
     "displacement": WeightDisplacement,
 }
 

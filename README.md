@@ -10,7 +10,8 @@ before it:
 
 - **Input modulators** transform the INR input `phi(x, z)`: `FUTONGate` encodes
   each coordinate with a Fourier tensor network and gates the encoding with the
-  encoder maps sampled at that coordinate.
+  encoder maps sampled at that coordinate, and `FeatureConcat` concatenates the
+  sampled maps with a code of the coordinate, such as a `HashEncoding`.
 - **Weight modulators** change the INR parameters `theta(z)`:
   `WeightDisplacement` predicts, from every position of the final encoder map, an
   additive displacement of the INR's weight matrices for each image.

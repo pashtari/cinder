@@ -18,12 +18,21 @@ import torch
 from torch import nn
 from torch.func import functional_call
 
-from cinder.models.inrs import MLP, SIREN, CosineBasis, CPCombiner, FUTONEncoding
+from cinder.models.inrs import (
+    MLP,
+    SIREN,
+    CosineBasis,
+    CPCombiner,
+    FUTONEncoding,
+    PositionalEncoding,
+)
 from cinder.models.modulators import (
     FUSIONS,
+    MODULATORS,
     AttentionFusion,
     BaseModulator,
     Camera,
+    FeatureConcat,
     FUTONGate,
     GridSampler,
     LinearWeightConditioner,
@@ -1502,6 +1511,74 @@ def test_displacement_can_read_several_maps():
     for bad in ((0, 1), (0, 0)):
         with pytest.raises(ValueError, match="cond_maps"):
             WeightDisplacement(nn.Linear(2, 3), 2, 3, cond_shape, cond_maps=bad)
+
+
+def test_concat_feeds_the_sampled_maps_and_the_code_to_the_inr():
+    torch.manual_seed(0)
+    cond_shape = ((5, 6, 7), (3, 4, 4))
+    code = partial(PositionalEncoding, num_frequencies=2)
+    concat = FeatureConcat(nn.Identity(), 2, 9, cond_shape, encoding=code)
+    coords = torch.rand(1, 11, 2) * 2 - 1
+    conds = [torch.randn(2, *shape) for shape in cond_shape]
+    out = concat(coords, conds)
+
+    sampled = [concat.sampler(coords[0], z) for z in conds]
+    expected = torch.cat([*sampled, concat.encoding(coords).expand(2, -1, -1)], -1)
+    torch.testing.assert_close(out, expected)
+    assert out.shape == (2, 11, 5 + 3 + concat.encoding.out_features)
+    assert MODULATORS["concat"] is FeatureConcat
+
+
+def test_concat_without_a_code_reads_the_coordinates():
+    inr = ("mlp", {"hidden_features": 8, "hidden_layers": 1})
+    concat = FeatureConcat(inr, 2, 3, (5, 6, 7))
+    assert concat.inr.in_features == 5 + 2
+    out = concat(torch.rand(1, 4, 2) * 2 - 1, torch.randn(2, 5, 6, 7))
+    assert out.shape == (2, 4, 3)
+
+
+def test_concat_samples_each_map_where_sample_at_maps_the_coordinates():
+    cond_shape = ((5, 6, 7), (5, 6, 7))
+    views = [_SelectAxes((0, 2)), partial(_SelectAxes, (1, 2))]
+    concat = FeatureConcat(nn.Identity(), 3, 9, cond_shape, sample_at=views)
+    coords = torch.rand(1, 11, 3) * 2 - 1
+    conds = [torch.randn(2, 5, 6, 7), torch.randn(2, 5, 6, 7)]
+    expected = torch.cat(
+        [
+            concat.sampler(coords[0][:, [0, 2]], conds[0]),
+            concat.sampler(coords[0][:, [1, 2]], conds[1]),
+            coords.expand(2, -1, -1),
+        ],
+        dim=-1,
+    )
+    torch.testing.assert_close(concat(coords, conds), expected)
+
+    with pytest.raises(ValueError, match="one entry per map"):
+        FeatureConcat(nn.Identity(), 3, 9, cond_shape, sample_at=views[:1])
+    with pytest.raises(ValueError, match="grids need 3 axes"):
+        FeatureConcat(nn.Identity(), 3, 9, cond_shape, sample_at=[None, views[1]])
+
+
+def test_concat_needs_coordinates_shared_by_the_batch():
+    concat = FeatureConcat(nn.Identity(), 2, 9, (5, 6, 7))
+    with pytest.raises(ValueError, match="shared by the batch"):
+        concat(torch.rand(2, 4, 2), torch.randn(2, 5, 6, 7))
+
+
+def test_concat_composes_with_weight_displacement():
+    torch.manual_seed(0)
+    model = ListModulators(
+        ("mlp", {"hidden_features": 8, "hidden_layers": 1}),
+        2,
+        3,
+        (5, 6, 7),
+        modulators=[("displacement", {"conditioner": "linear"}), "concat"],
+    )
+    displacement, concat = model.modulators
+    assert isinstance(concat, FeatureConcat)
+    assert displacement.inr.in_features == 5 + 2
+    out = model(torch.rand(1, 4, 2) * 2 - 1, torch.randn(2, 5, 6, 7))
+    assert out.shape == (2, 4, 3)
 
 
 def test_camera_divides_by_the_projective_coordinate_in_float32():
